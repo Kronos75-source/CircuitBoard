@@ -1,0 +1,778 @@
+"""
+Hybrid Physics-ML Model for Permafrost Ground Temperature
+==========================================================
+TTOP (physics baseline) + ML Residual Learning
+
+Workflow:
+1. Calculate TTOP v1 for all samples (physics-based baseline)
+2. Compute residuals: residual = MAGT_observed - TTOP
+3. Train XGBoost/RF ensemble to predict residuals
+4. Final prediction: MAGT_pred = TTOP + ML_residual
+
+This lets ML focus on local corrections rather than
+learning the full physics from scratch.
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import joblib
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+WANG_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Big Game\01_Test\wang2018_RS_features_2000_2016_v3.csv"
+WANG_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Big Game\01_Test\wang2018_annual_summary.csv"
+GTNP_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Circuit Board\02_Test\gtnp_RS_features_2002_2012.csv"
+GTNP_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Circuit Board\02_Test\gtnp_annual_summary.csv"
+
+OUTPUT_DIR = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Circuit Board\02_Test"
+
+
+# =============================================================================
+# 1. LOAD DATA
+# =============================================================================
+
+def load_data():
+    """Load and combine both datasets."""
+    
+    print("=" * 60)
+    print("LOADING DATA")
+    print("=" * 60)
+    
+    # Wang2018
+    rs1 = pd.read_csv(WANG_RS_PATH)
+    gt1 = pd.read_csv(WANG_GT_PATH)
+    rs1['Code'] = rs1['Code'].astype(str).str.strip()
+    gt1['Code'] = gt1['Code'].astype(str).str.strip()
+    
+    gt1_cols = ['Code', 'Year', 'MAGT_100cm']
+    for col in ['Lat', 'Lon']:
+        if col in gt1.columns:
+            gt1_cols.append(col)
+    
+    wang = pd.merge(rs1, gt1[gt1_cols], on=['Code', 'Year'], how='inner')
+    wang['source'] = 'Wang2018'
+    print(f"Wang2018: {len(wang)} rows, {wang['Code'].nunique()} sites")
+    
+    # GTN-P
+    rs2 = pd.read_csv(GTNP_RS_PATH)
+    gt2 = pd.read_csv(GTNP_GT_PATH)
+    rs2['Code'] = rs2['Code'].astype(str).str.strip()
+    gt2['Code'] = gt2['Code'].astype(str).str.strip()
+    gt2 = gt2.dropna(subset=['MAGT_100cm'])
+    
+    gt2_cols = ['Code', 'Year', 'MAGT_100cm']
+    for col in ['latitude', 'longitude', 'Lat', 'Lon']:
+        if col in gt2.columns:
+            gt2_cols.append(col)
+    
+    gtnp = pd.merge(rs2, gt2[gt2_cols], on=['Code', 'Year'], how='inner')
+    
+    if 'latitude' in gtnp.columns and 'Lat' not in gtnp.columns:
+        gtnp['Lat'] = gtnp['latitude']
+    if 'longitude' in gtnp.columns and 'Lon' not in gtnp.columns:
+        gtnp['Lon'] = gtnp['longitude']
+    
+    gtnp['source'] = 'GTN-P'
+    print(f"GTN-P: {len(gtnp)} rows, {gtnp['Code'].nunique()} sites")
+    
+    # Combine
+    combined = pd.concat([wang, gtnp], ignore_index=True)
+    print(f"Combined: {len(combined)} rows, {combined['Code'].nunique()} sites")
+    
+    return combined
+
+
+# =============================================================================
+# 2. CALCULATE TTOP (Version 1 - Best performer)
+# =============================================================================
+
+def calculate_ttop(df):
+    """
+    TTOP v1: Classic Smith & Riseborough formulation
+    
+    TTOP = (nt * DDT - nf * DDF) / P
+    
+    Returns TTOP predictions and the estimated n-factors for transparency.
+    """
+    
+    print("\n" + "=" * 60)
+    print("CALCULATING TTOP (Physics Baseline)")
+    print("=" * 60)
+    
+    data = df.copy()
+    
+    # Clean required columns
+    for col in ['DDT_Cdays', 'DDF_Cdays', 'NDVI_summer_mean', 'SWE_winter_mean_mm']:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+            data[col] = data[col].replace([-9999, -999.99], np.nan)
+    
+    # Estimate n-factors from available data
+    # nt (thawing n-factor): More vegetation = lower nt (shading effect)
+    ndvi = data['NDVI_summer_mean'].fillna(0.3).clip(0, 1)
+    nt = 1.0 - 0.3 * ndvi  # Range: 0.7 - 1.0
+    
+    # nf (freezing n-factor): More snow = lower nf (insulation effect)
+    swe = data['SWE_winter_mean_mm'].fillna(50)
+    swe_max = swe.max() if swe.max() > 0 else 1
+    nf = 0.7 - 0.3 * (swe / swe_max).clip(0, 1)  # Range: 0.4 - 0.7
+    
+    # Calculate TTOP
+    P = 365  # days
+    ttop = (nt * data['DDT_Cdays'] - nf * data['DDF_Cdays']) / P
+    
+    print(f"  n_t (thawing):  mean={nt.mean():.3f}, range=[{nt.min():.3f}, {nt.max():.3f}]")
+    print(f"  n_f (freezing): mean={nf.mean():.3f}, range=[{nf.min():.3f}, {nf.max():.3f}]")
+    print(f"  TTOP range: {ttop.min():.2f} to {ttop.max():.2f}°C")
+    
+    # Store n-factors for potential use as features
+    data['TTOP'] = ttop
+    data['nt'] = nt
+    data['nf'] = nf
+    
+    return data
+
+
+# =============================================================================
+# 3. PREPARE FEATURES FOR RESIDUAL LEARNING
+# =============================================================================
+
+def prepare_features(df):
+    """
+    Prepare features for ML residual learning.
+    
+    Target: residual = MAGT_observed - TTOP
+    Features: All RS features + TTOP + n-factors
+    """
+    
+    print("\n" + "=" * 60)
+    print("PREPARING FEATURES FOR RESIDUAL LEARNING")
+    print("=" * 60)
+    
+    data = df.copy()
+    
+    # Calculate residual (what TTOP misses)
+    data['residual'] = data['MAGT_100cm'] - data['TTOP']
+    
+    print(f"Residual stats:")
+    print(f"  Mean: {data['residual'].mean():.2f}°C (TTOP bias)")
+    print(f"  Std:  {data['residual'].std():.2f}°C")
+    print(f"  Range: {data['residual'].min():.2f} to {data['residual'].max():.2f}°C")
+    
+    # Define features
+    # Include TTOP and n-factors so ML can learn to correct them
+    feature_cols = [
+        # Terrain
+        'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+        # Vegetation
+        'landcover_class', 'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
+        # Climate
+        'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+        'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
+        'SWE_duration_days', 'SWE_winter_mean_mm',
+        # LST
+        'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C',
+        # TTOP components (so ML can learn corrections)
+        'TTOP', 'nt', 'nf'
+    ]
+    
+    available_features = [c for c in feature_cols if c in data.columns]
+    print(f"\nAvailable features: {len(available_features)}")
+    
+    # Clean data
+    for col in available_features + ['residual', 'MAGT_100cm']:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+            data[col] = data[col].replace([-9999, -999.99], np.nan)
+            data[col] = data[col].replace([np.inf, -np.inf], np.nan)
+    
+    # Drop rows with missing target or features
+    data = data.dropna(subset=['residual', 'MAGT_100cm', 'TTOP'])
+    data = data.dropna(subset=available_features)
+    
+    print(f"Complete cases: {len(data)}")
+    print(f"  Wang2018: {len(data[data['source'] == 'Wang2018'])} rows")
+    print(f"  GTN-P: {len(data[data['source'] == 'GTN-P'])} rows")
+    
+    X = data[available_features].values.astype(np.float64)
+    y_residual = data['residual'].values
+    y_magt = data['MAGT_100cm'].values
+    ttop = data['TTOP'].values
+    
+    print(f"\nFinal X shape: {X.shape}")
+    print(f"Residual range: {y_residual.min():.2f} to {y_residual.max():.2f}°C")
+    
+    return X, y_residual, y_magt, ttop, available_features, data
+
+
+# =============================================================================
+# 4. DEFINE MODELS
+# =============================================================================
+
+def get_xgboost():
+    return xgb.XGBRegressor(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        random_state=42,
+        n_jobs=-1
+    )
+
+def get_randomforest():
+    return RandomForestRegressor(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_split=5,
+        min_samples_leaf=3,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=-1
+    )
+
+
+# =============================================================================
+# 5. CROSS-VALIDATION: HYBRID MODEL
+# =============================================================================
+
+def run_hybrid_cv(X, y_residual, y_magt, ttop, feature_names, df, n_splits=5):
+    """
+    Cross-validation for hybrid TTOP + ML model.
+    
+    Compares:
+    1. TTOP alone
+    2. ML alone (predicting MAGT directly)
+    3. Hybrid (TTOP + ML residual)
+    """
+    
+    print("\n" + "=" * 60)
+    print("HYBRID MODEL CROSS-VALIDATION")
+    print("=" * 60)
+    
+    groups = df['Code'].values
+    unique_sites = df['Code'].nunique()
+    n_splits = min(n_splits, unique_sites)
+    
+    print(f"Sites: {unique_sites}, Folds: {n_splits}")
+    
+    group_kfold = GroupKFold(n_splits=n_splits)
+    
+    # Results storage
+    results = {
+        'TTOP_only': {'r2': [], 'rmse': [], 'mae': []},
+        'ML_only_XGB': {'r2': [], 'rmse': [], 'mae': []},
+        'ML_only_RF': {'r2': [], 'rmse': [], 'mae': []},
+        'Hybrid_XGB': {'r2': [], 'rmse': [], 'mae': []},
+        'Hybrid_RF': {'r2': [], 'rmse': [], 'mae': []},
+        'Hybrid_Ensemble': {'r2': [], 'rmse': [], 'mae': []}
+    }
+    
+    # Track for weight calculation
+    all_rmse_xgb = []
+    all_rmse_rf = []
+    
+    fold = 1
+    for train_idx, test_idx in group_kfold.split(X, y_residual, groups):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_res_train, y_res_test = y_residual[train_idx], y_residual[test_idx]
+        y_magt_train, y_magt_test = y_magt[train_idx], y_magt[test_idx]
+        ttop_test = ttop[test_idx]
+        
+        n_sites_test = len(set(groups[test_idx]))
+        print(f"\n--- Fold {fold} ({n_sites_test} sites held out) ---")
+        
+        # ----- TTOP Only -----
+        r2 = r2_score(y_magt_test, ttop_test)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, ttop_test))
+        mae = mean_absolute_error(y_magt_test, ttop_test)
+        results['TTOP_only']['r2'].append(r2)
+        results['TTOP_only']['rmse'].append(rmse)
+        results['TTOP_only']['mae'].append(mae)
+        print(f"  {'TTOP only':20s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # ----- ML Only (XGBoost predicting MAGT directly) -----
+        model_xgb_direct = get_xgboost()
+        model_xgb_direct.fit(X_train, y_magt_train)
+        y_pred_xgb_direct = model_xgb_direct.predict(X_test)
+        
+        r2 = r2_score(y_magt_test, y_pred_xgb_direct)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_xgb_direct))
+        mae = mean_absolute_error(y_magt_test, y_pred_xgb_direct)
+        results['ML_only_XGB']['r2'].append(r2)
+        results['ML_only_XGB']['rmse'].append(rmse)
+        results['ML_only_XGB']['mae'].append(mae)
+        print(f"  {'ML only (XGB)':20s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # ----- ML Only (RandomForest predicting MAGT directly) -----
+        model_rf_direct = get_randomforest()
+        model_rf_direct.fit(X_train, y_magt_train)
+        y_pred_rf_direct = model_rf_direct.predict(X_test)
+        
+        r2 = r2_score(y_magt_test, y_pred_rf_direct)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_rf_direct))
+        mae = mean_absolute_error(y_magt_test, y_pred_rf_direct)
+        results['ML_only_RF']['r2'].append(r2)
+        results['ML_only_RF']['rmse'].append(rmse)
+        results['ML_only_RF']['mae'].append(mae)
+        print(f"  {'ML only (RF)':20s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # ----- Hybrid: XGBoost predicting residual -----
+        model_xgb_res = get_xgboost()
+        model_xgb_res.fit(X_train, y_res_train)
+        res_pred_xgb = model_xgb_res.predict(X_test)
+        y_pred_hybrid_xgb = ttop_test + res_pred_xgb
+        
+        r2 = r2_score(y_magt_test, y_pred_hybrid_xgb)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_hybrid_xgb))
+        mae = mean_absolute_error(y_magt_test, y_pred_hybrid_xgb)
+        results['Hybrid_XGB']['r2'].append(r2)
+        results['Hybrid_XGB']['rmse'].append(rmse)
+        results['Hybrid_XGB']['mae'].append(mae)
+        all_rmse_xgb.append(rmse)
+        print(f"  {'Hybrid (TTOP+XGB)':20s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # ----- Hybrid: RandomForest predicting residual -----
+        model_rf_res = get_randomforest()
+        model_rf_res.fit(X_train, y_res_train)
+        res_pred_rf = model_rf_res.predict(X_test)
+        y_pred_hybrid_rf = ttop_test + res_pred_rf
+        
+        r2 = r2_score(y_magt_test, y_pred_hybrid_rf)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_hybrid_rf))
+        mae = mean_absolute_error(y_magt_test, y_pred_hybrid_rf)
+        results['Hybrid_RF']['r2'].append(r2)
+        results['Hybrid_RF']['rmse'].append(rmse)
+        results['Hybrid_RF']['mae'].append(mae)
+        all_rmse_rf.append(rmse)
+        print(f"  {'Hybrid (TTOP+RF)':20s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # ----- Hybrid Ensemble (weighted average of XGB and RF residuals) -----
+        # Use inverse RMSE weighting
+        rmse_xgb = np.sqrt(mean_squared_error(y_magt_test, y_pred_hybrid_xgb))
+        rmse_rf = np.sqrt(mean_squared_error(y_magt_test, y_pred_hybrid_rf))
+        w_xgb = (1/rmse_xgb) / (1/rmse_xgb + 1/rmse_rf)
+        w_rf = (1/rmse_rf) / (1/rmse_xgb + 1/rmse_rf)
+        
+        res_pred_ensemble = w_xgb * res_pred_xgb + w_rf * res_pred_rf
+        y_pred_hybrid_ens = ttop_test + res_pred_ensemble
+        
+        r2 = r2_score(y_magt_test, y_pred_hybrid_ens)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_hybrid_ens))
+        mae = mean_absolute_error(y_magt_test, y_pred_hybrid_ens)
+        results['Hybrid_Ensemble']['r2'].append(r2)
+        results['Hybrid_Ensemble']['rmse'].append(rmse)
+        results['Hybrid_Ensemble']['mae'].append(mae)
+        print(f"  {'Hybrid (Ensemble)':20s}: R²={r2:.3f}, RMSE={rmse:.2f}°C  [XGB:{w_xgb:.2f}, RF:{w_rf:.2f}]")
+        
+        fold += 1
+    
+    # Calculate global weights
+    mean_rmse_xgb = np.mean(all_rmse_xgb)
+    mean_rmse_rf = np.mean(all_rmse_rf)
+    global_w_xgb = (1/mean_rmse_xgb) / (1/mean_rmse_xgb + 1/mean_rmse_rf)
+    global_w_rf = (1/mean_rmse_rf) / (1/mean_rmse_xgb + 1/mean_rmse_rf)
+    
+    results['global_weights'] = {'XGBoost': global_w_xgb, 'RandomForest': global_w_rf}
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("CROSS-VALIDATION SUMMARY")
+    print("=" * 60)
+    print(f"\n{'Model':<22} {'R²':>12} {'RMSE (°C)':>14} {'MAE (°C)':>14}")
+    print("-" * 64)
+    
+    model_order = ['TTOP_only', 'ML_only_XGB', 'ML_only_RF', 'Hybrid_XGB', 'Hybrid_RF', 'Hybrid_Ensemble']
+    display_names = ['TTOP only', 'ML only (XGB)', 'ML only (RF)', 'Hybrid TTOP+XGB', 'Hybrid TTOP+RF', 'Hybrid Ensemble']
+    
+    for name, display in zip(model_order, display_names):
+        r2_mean = np.mean(results[name]['r2'])
+        r2_std = np.std(results[name]['r2'])
+        rmse_mean = np.mean(results[name]['rmse'])
+        rmse_std = np.std(results[name]['rmse'])
+        mae_mean = np.mean(results[name]['mae'])
+        mae_std = np.std(results[name]['mae'])
+        
+        print(f"{display:<22} {r2_mean:>5.3f}±{r2_std:<5.3f} {rmse_mean:>6.2f}±{rmse_std:<5.2f} {mae_mean:>6.2f}±{mae_std:<5.2f}")
+        
+        results[name]['r2_mean'] = r2_mean
+        results[name]['r2_std'] = r2_std
+        results[name]['rmse_mean'] = rmse_mean
+        results[name]['rmse_std'] = rmse_std
+        results[name]['mae_mean'] = mae_mean
+        results[name]['mae_std'] = mae_std
+    
+    print(f"\nOptimal weights: XGBoost={global_w_xgb:.3f}, RandomForest={global_w_rf:.3f}")
+    
+    # Find best model
+    best_model = max(model_order, key=lambda x: results[x]['r2_mean'])
+    print(f"Best model: {best_model} (R² = {results[best_model]['r2_mean']:.3f})")
+    
+    return results
+
+
+# =============================================================================
+# 6. TRAIN FINAL HYBRID MODEL
+# =============================================================================
+
+def train_final_hybrid(X, y_residual, y_magt, ttop, weights):
+    """Train final hybrid models on all data."""
+    
+    print("\n" + "=" * 60)
+    print("TRAINING FINAL HYBRID MODEL")
+    print("=" * 60)
+    
+    print("Training XGBoost (residual)...")
+    model_xgb = get_xgboost()
+    model_xgb.fit(X, y_residual)
+    
+    print("Training RandomForest (residual)...")
+    model_rf = get_randomforest()
+    model_rf.fit(X, y_residual)
+    
+    print("Done.")
+    
+    return {'XGBoost': model_xgb, 'RandomForest': model_rf}
+
+
+# =============================================================================
+# 7. HYBRID MODEL CLASS
+# =============================================================================
+
+class HybridTTOPModel:
+    """
+    Hybrid physics-ML model.
+    
+    Prediction = TTOP + weighted_ensemble(ML_residuals)
+    """
+    
+    def __init__(self, models, weights, feature_names):
+        self.models = models
+        self.weights = weights
+        self.feature_names = feature_names
+    
+    def predict_residual(self, X):
+        """Predict the residual (MAGT - TTOP)."""
+        if isinstance(X, pd.DataFrame):
+            X = X.values.astype(np.float64)
+        else:
+            X = X.astype(np.float64)
+        
+        res_xgb = self.models['XGBoost'].predict(X)
+        res_rf = self.models['RandomForest'].predict(X)
+        
+        return (self.weights['XGBoost'] * res_xgb + 
+                self.weights['RandomForest'] * res_rf)
+    
+    def predict(self, X, ttop):
+        """Predict MAGT = TTOP + ML_residual."""
+        residual = self.predict_residual(X)
+        return ttop + residual
+    
+    def predict_components(self, X, ttop):
+        """Get all prediction components for analysis."""
+        if isinstance(X, pd.DataFrame):
+            X = X.values.astype(np.float64)
+        else:
+            X = X.astype(np.float64)
+        
+        res_xgb = self.models['XGBoost'].predict(X)
+        res_rf = self.models['RandomForest'].predict(X)
+        res_ensemble = self.weights['XGBoost'] * res_xgb + self.weights['RandomForest'] * res_rf
+        
+        return {
+            'TTOP': ttop,
+            'residual_XGBoost': res_xgb,
+            'residual_RF': res_rf,
+            'residual_ensemble': res_ensemble,
+            'MAGT_pred': ttop + res_ensemble
+        }
+
+
+# =============================================================================
+# 8. VISUALIZATION
+# =============================================================================
+
+def plot_hybrid_results(hybrid_model, X, y_magt, ttop, df, cv_results, output_dir):
+    """Generate diagnostic plots for hybrid model."""
+    
+    print("\n" + "=" * 60)
+    print("GENERATING PLOTS")
+    print("=" * 60)
+    
+    components = hybrid_model.predict_components(X, ttop)
+    y_pred = components['MAGT_pred']
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    colors = df['source'].map({'Wang2018': 'steelblue', 'GTN-P': 'orange'}).values
+    
+    # 1: TTOP only
+    ax = axes[0, 0]
+    ax.scatter(y_magt, ttop, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([y_magt.min(), y_magt.max()], [y_magt.min(), y_magt.max()], 'r--', lw=2)
+    r2 = r2_score(y_magt, ttop)
+    rmse = np.sqrt(mean_squared_error(y_magt, ttop))
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'TTOP Only (Physics)\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    
+    # 2: Hybrid model
+    ax = axes[0, 1]
+    ax.scatter(y_magt, y_pred, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([y_magt.min(), y_magt.max()], [y_magt.min(), y_magt.max()], 'r--', lw=2)
+    r2 = r2_score(y_magt, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_magt, y_pred))
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'Hybrid (TTOP + ML Residual)\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='steelblue', label='Wang2018'),
+                       Patch(facecolor='orange', label='GTN-P')]
+    ax.legend(handles=legend_elements, loc='lower right')
+    
+    # 3: Residual learned by ML
+    ax = axes[0, 2]
+    true_residual = y_magt - ttop
+    pred_residual = components['residual_ensemble']
+    ax.scatter(true_residual, pred_residual, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([true_residual.min(), true_residual.max()], 
+            [true_residual.min(), true_residual.max()], 'r--', lw=2)
+    r2_res = r2_score(true_residual, pred_residual)
+    ax.set_xlabel('True Residual (MAGT - TTOP) (°C)')
+    ax.set_ylabel('Predicted Residual (°C)')
+    ax.set_title(f'ML Residual Learning\nR²={r2_res:.3f}')
+    ax.grid(True, alpha=0.3)
+    
+    # 4: CV comparison
+    ax = axes[1, 0]
+    models = ['TTOP_only', 'ML_only_RF', 'Hybrid_Ensemble']
+    display = ['TTOP Only', 'ML Only', 'Hybrid']
+    r2_means = [cv_results[m]['r2_mean'] for m in models]
+    r2_stds = [cv_results[m]['r2_std'] for m in models]
+    bar_colors = ['gray', 'steelblue', 'crimson']
+    
+    bars = ax.bar(display, r2_means, yerr=r2_stds, capsize=5, color=bar_colors, alpha=0.8)
+    ax.set_ylabel('R² (Site-Grouped CV)')
+    ax.set_title('Model Comparison')
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    for bar, mean in zip(bars, r2_means):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                f'{mean:.3f}', ha='center', va='bottom', fontsize=11)
+    
+    # 5: Improvement from TTOP to Hybrid
+    ax = axes[1, 1]
+    improvement = y_pred - ttop  # How much ML corrected
+    error_ttop = ttop - y_magt
+    error_hybrid = y_pred - y_magt
+    
+    ax.scatter(error_ttop, error_hybrid, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.axhline(0, color='r', linestyle='--', lw=1)
+    ax.axvline(0, color='r', linestyle='--', lw=1)
+    ax.plot([-6, 6], [-6, 6], 'k:', alpha=0.5)  # No improvement line
+    ax.set_xlabel('TTOP Error (°C)')
+    ax.set_ylabel('Hybrid Error (°C)')
+    ax.set_title('Error Reduction\n(points below diagonal = improvement)')
+    ax.set_xlim(-6, 6)
+    ax.set_ylim(-6, 6)
+    ax.grid(True, alpha=0.3)
+    
+    # 6: Residuals by MAAT
+    ax = axes[1, 2]
+    residuals_ttop = ttop - y_magt
+    residuals_hybrid = y_pred - y_magt
+    
+    ax.scatter(df['MAAT_C'].values, residuals_ttop, alpha=0.4, s=20, c='gray', label='TTOP')
+    ax.scatter(df['MAAT_C'].values, residuals_hybrid, alpha=0.4, s=20, c='crimson', label='Hybrid')
+    ax.axhline(0, color='k', linestyle='--', lw=1)
+    ax.set_xlabel('MAAT (°C)')
+    ax.set_ylabel('Residual (°C)')
+    ax.set_title('Residuals by Air Temperature')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    output_path = Path(output_dir) / 'hybrid_ttop_ml_diagnostic.png'
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved plots to: {output_path}")
+    plt.close()
+
+
+# =============================================================================
+# 9. SAVE RESULTS
+# =============================================================================
+
+def save_results(hybrid_model, cv_results, X, y_magt, ttop, df, feature_names, output_dir):
+    """Save hybrid model and results."""
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save models
+    hybrid_model.models['XGBoost'].save_model(output_dir / 'hybrid_xgboost_residual.json')
+    joblib.dump(hybrid_model.models['RandomForest'], output_dir / 'hybrid_rf_residual.joblib')
+    
+    with open(output_dir / 'hybrid_weights.json', 'w') as f:
+        json.dump(hybrid_model.weights, f, indent=2)
+    
+    with open(output_dir / 'feature_names.json', 'w') as f:
+        json.dump(feature_names, f, indent=2)
+    
+    print(f"Saved models to {output_dir}")
+    
+    # Save predictions
+    components = hybrid_model.predict_components(X, ttop)
+    
+    df_out = df.copy()
+    df_out['TTOP'] = ttop
+    df_out['residual_true'] = y_magt - ttop
+    df_out['residual_pred'] = components['residual_ensemble']
+    df_out['MAGT_pred_hybrid'] = components['MAGT_pred']
+    df_out['error_TTOP'] = ttop - y_magt
+    df_out['error_hybrid'] = components['MAGT_pred'] - y_magt
+    
+    df_out.to_csv(output_dir / 'hybrid_predictions.csv', index=False)
+    print(f"Saved predictions to: {output_dir / 'hybrid_predictions.csv'}")
+    
+    # Summary
+    summary_lines = [
+        "Hybrid TTOP + ML Model",
+        "=" * 50,
+        "",
+        "APPROACH:",
+        "  1. TTOP provides physics-based baseline",
+        "  2. ML ensemble learns residuals (MAGT - TTOP)",
+        "  3. Final: MAGT_pred = TTOP + ML_residual",
+        "",
+        f"Weights: XGBoost={hybrid_model.weights['XGBoost']:.3f}, RF={hybrid_model.weights['RandomForest']:.3f}",
+        "",
+        "CROSS-VALIDATION RESULTS:",
+        "-" * 50,
+    ]
+    
+    for name, display in [('TTOP_only', 'TTOP only'), 
+                          ('ML_only_RF', 'ML only (RF)'),
+                          ('Hybrid_Ensemble', 'Hybrid (TTOP+ML)')]:
+        r = cv_results[name]
+        summary_lines.append(f"  {display:<20}: R²={r['r2_mean']:.3f}±{r['r2_std']:.3f}, RMSE={r['rmse_mean']:.2f}±{r['rmse_std']:.2f}°C")
+    
+    # Calculate improvement
+    ttop_r2 = cv_results['TTOP_only']['r2_mean']
+    ml_r2 = cv_results['ML_only_RF']['r2_mean']
+    hybrid_r2 = cv_results['Hybrid_Ensemble']['r2_mean']
+    
+    summary_lines.extend([
+        "",
+        "IMPROVEMENT:",
+        f"  TTOP baseline:      R² = {ttop_r2:.3f}",
+        f"  ML only:            R² = {ml_r2:.3f}",
+        f"  Hybrid:             R² = {hybrid_r2:.3f}",
+        f"  Gain over TTOP:     +{hybrid_r2 - ttop_r2:.3f}",
+        f"  Gain over ML only:  {hybrid_r2 - ml_r2:+.3f}",
+    ])
+    
+    with open(output_dir / 'hybrid_summary.txt', 'w') as f:
+        f.write('\n'.join(summary_lines))
+    
+    print(f"Saved summary to: {output_dir / 'hybrid_summary.txt'}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    
+    print("\n" + "=" * 60)
+    print("HYBRID PHYSICS-ML MODEL")
+    print("TTOP + ML Residual Learning")
+    print("=" * 60)
+    
+    # Check files
+    missing = []
+    for path, name in [(WANG_RS_PATH, "Wang2018 RS"), (WANG_GT_PATH, "Wang2018 GT"),
+                       (GTNP_RS_PATH, "GTN-P RS"), (GTNP_GT_PATH, "GTN-P GT")]:
+        if not Path(path).exists():
+            missing.append(f"{name}: {path}")
+    
+    if missing:
+        print("\n❌ Missing files:")
+        for m in missing:
+            print(f"  - {m}")
+        exit(1)
+    
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Load data
+        df = load_data()
+        
+        # Calculate TTOP
+        df = calculate_ttop(df)
+        
+        # Prepare features
+        X, y_residual, y_magt, ttop, feature_names, df_clean = prepare_features(df)
+        
+        # Cross-validation
+        cv_results = run_hybrid_cv(X, y_residual, y_magt, ttop, feature_names, df_clean)
+        
+        # Train final model
+        trained_models = train_final_hybrid(X, y_residual, y_magt, ttop, cv_results['global_weights'])
+        
+        # Create hybrid model
+        hybrid_model = HybridTTOPModel(
+            models=trained_models,
+            weights=cv_results['global_weights'],
+            feature_names=feature_names
+        )
+        
+        # Plot
+        plot_hybrid_results(hybrid_model, X, y_magt, ttop, df_clean, cv_results, OUTPUT_DIR)
+        
+        # Save
+        save_results(hybrid_model, cv_results, X, y_magt, ttop, df_clean, feature_names, OUTPUT_DIR)
+        
+        # Final summary
+        print("\n" + "=" * 60)
+        print("✓ HYBRID MODEL COMPLETE")
+        print("=" * 60)
+        
+        ttop_r2 = cv_results['TTOP_only']['r2_mean']
+        ml_r2 = cv_results['ML_only_RF']['r2_mean']
+        hybrid_r2 = cv_results['Hybrid_Ensemble']['r2_mean']
+        
+        print(f"\nTTOP only:     R² = {ttop_r2:.3f}")
+        print(f"ML only:       R² = {ml_r2:.3f}")
+        print(f"Hybrid:        R² = {hybrid_r2:.3f}")
+        
+        print("\n" + "-" * 40)
+        print("COMPARISON TO ALL PREVIOUS MODELS:")
+        print("-" * 40)
+        print(f"Wang2018 only (baseline):  R² = 0.577")
+        print(f"Combined datasets:         R² = 0.627")
+        print(f"Hybrid TTOP + ML:          R² = {hybrid_r2:.3f}")
+        print(f"Total improvement:         {hybrid_r2 - 0.577:+.3f}")
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
