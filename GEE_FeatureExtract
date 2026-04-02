@@ -1,0 +1,297 @@
+// ============================================================
+// GTN-P SITES - RS Feature Extraction for Model Training
+// Extracts features for years 2002-2012 to match MAGT data
+// ============================================================
+
+// ------------------------------------------------------------
+// 1. LOAD GTN-P SITES
+// ------------------------------------------------------------
+
+var sites = ee.FeatureCollection('projects/nrt-extent/assets/gtnp_site_metadata');
+
+print('GTN-P Sites loaded:', sites.size());
+print('Sample site:', sites.first());
+
+// Rename columns to match expected format
+var sitesFormatted = sites.map(function(f) {
+  return ee.Feature(ee.Geometry.Point([f.get('longitude'), f.get('latitude')]))
+    .set('Code', f.get('Code'))
+    .set('Lat', f.get('latitude'))
+    .set('Lon', f.get('longitude'))
+    .set('borehole_id', f.get('borehole_id'))
+    .set('site_name', f.get('site_name'));
+});
+
+Map.centerObject(sites, 5);
+Map.addLayer(sitesFormatted, {color: 'red'}, 'GTN-P Sites');
+
+// Study area buffer around all sites
+var studyArea = sitesFormatted.geometry().buffer(50000);
+
+// ------------------------------------------------------------
+// 2. DEFINE YEARS TO EXTRACT
+// ------------------------------------------------------------
+
+var years = ee.List.sequence(2002, 2012);
+print('Years to process:', years);
+
+// ------------------------------------------------------------
+// 3. TERRAIN FEATURES (Static - same for all years)
+// ------------------------------------------------------------
+
+var dem = ee.Image('USGS/GMTED2010').select('be75').rename('elevation_m');
+var slope = ee.Terrain.slope(dem).rename('slope_deg');
+var aspect = ee.Terrain.aspect(dem).rename('aspect_deg');
+var aspectRad = aspect.multiply(Math.PI / 180);
+var northness = aspectRad.cos().rename('northness');
+var eastness = aspectRad.sin().rename('eastness');
+var tpi = dem.subtract(dem.focal_mean(500, 'circle', 'meters')).rename('TPI_500m');
+var slopeRad = slope.multiply(Math.PI / 180);
+var twi = slopeRad.tan().add(0.001).log().multiply(-1).rename('TWI');
+
+var terrainStack = dem.addBands(slope).addBands(northness).addBands(eastness).addBands(tpi).addBands(twi);
+
+// ------------------------------------------------------------
+// 4. HELPER FUNCTION FOR NO-DATA
+// ------------------------------------------------------------
+
+var createConstantBand = function(bandName, value) {
+  return ee.Image.constant(value).rename(bandName).float();
+};
+
+// ------------------------------------------------------------
+// 5. ANNUAL FEATURE FUNCTIONS
+// ------------------------------------------------------------
+
+// Land cover (use closest available year)
+var getLandcover = function(year) {
+  year = ee.Number(year);
+  // MCD12Q1 starts in 2001
+  var lcYear = year.max(2001);
+  var lc = ee.ImageCollection('MODIS/006/MCD12Q1')
+    .filterDate(ee.Date.fromYMD(lcYear, 1, 1), ee.Date.fromYMD(lcYear, 12, 31))
+    .first();
+  return ee.Image(ee.Algorithms.If(lc,
+    ee.Image(lc).select('LC_Type1').rename('landcover_class'),
+    createConstantBand('landcover_class', -9999)));
+};
+
+// NDVI from Landsat
+var getSummerNDVI = function(year) {
+  year = ee.Number(year);
+  var startDate = ee.Date.fromYMD(year, 6, 1);
+  var endDate = ee.Date.fromYMD(year, 8, 31);
+  
+  // Landsat 5 (available 2002-2011)
+  var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+    .filterDate(startDate, endDate).filterBounds(studyArea)
+    .map(function(img) { 
+      return img.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI'); 
+    });
+  
+  // Landsat 7 (available all years, but SLC-off after 2003)
+  var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+    .filterDate(startDate, endDate).filterBounds(studyArea)
+    .map(function(img) { 
+      return img.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI'); 
+    });
+  
+  // Landsat 8 (available 2013+, won't have data for 2002-2012)
+  var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterDate(startDate, endDate).filterBounds(studyArea)
+    .map(function(img) { 
+      return img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'); 
+    });
+  
+  var allNDVI = l5.merge(l7).merge(l8);
+  
+  var emptyImage = createConstantBand('NDVI_summer_mean', -9999)
+    .addBands(createConstantBand('NDVI_summer_max', -9999));
+  
+  return ee.Image(ee.Algorithms.If(
+    allNDVI.size().gt(0),
+    allNDVI.mean().rename('NDVI_summer_mean')
+      .addBands(allNDVI.max().rename('NDVI_summer_max')),
+    emptyImage
+  ));
+};
+
+// MODIS NDVI
+var getMODIS_NDVI = function(year) {
+  year = ee.Number(year);
+  var modis = ee.ImageCollection('MODIS/006/MOD13Q1')
+    .filterDate(ee.Date.fromYMD(year, 6, 1), ee.Date.fromYMD(year, 8, 31))
+    .filterBounds(studyArea)
+    .select('NDVI');
+  
+  return ee.Image(ee.Algorithms.If(
+    modis.size().gt(0),
+    modis.mean().multiply(0.0001).rename('NDVI_MODIS_summer'),
+    createConstantBand('NDVI_MODIS_summer', -9999)
+  ));
+};
+
+// Daymet climate features
+var getDaymetFeatures = function(year) {
+  year = ee.Number(year);
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  
+  var daymet = ee.ImageCollection('NASA/ORNL/DAYMET_V4')
+    .filterDate(startDate, endDate)
+    .filterBounds(studyArea);
+  
+  // Mean annual air temperature
+  var tmean = daymet.select('tmax').mean()
+    .add(daymet.select('tmin').mean())
+    .divide(2)
+    .rename('MAAT_C');
+  
+  // Daily mean for degree days
+  var dailyMean = daymet.map(function(img) {
+    return img.select('tmax').add(img.select('tmin')).divide(2).rename('tavg');
+  });
+  
+  // Degree days thawing (sum of positive temps)
+  var ddt = dailyMean.map(function(img) {
+    return img.updateMask(img.gt(0));
+  }).sum().unmask(0).rename('DDT_Cdays');
+  
+  // Degree days freezing (sum of negative temps, made positive)
+  var ddf = dailyMean.map(function(img) {
+    return img.updateMask(img.lt(0)).multiply(-1);
+  }).sum().unmask(0).rename('DDF_Cdays');
+  
+  // Freeze-thaw ratio
+  var ft_ratio = ddt.divide(ddf.add(1)).rename('FT_ratio');
+  
+  // Precipitation
+  var precip = daymet.select('prcp').sum().rename('precip_mm_annual');
+  
+  // Snow water equivalent
+  var swe = daymet.select('swe');
+  var swe_mean = swe.mean().rename('SWE_mean_mm');
+  var swe_max = swe.max().rename('SWE_max_mm');
+  var snowDays = swe.map(function(img) {
+    return img.gt(0);
+  }).sum().rename('SWE_duration_days');
+  
+  // Winter SWE (Jan-Mar)
+  var sweWinter = ee.ImageCollection('NASA/ORNL/DAYMET_V4')
+    .filterDate(ee.Date.fromYMD(year, 1, 1), ee.Date.fromYMD(year, 3, 31))
+    .filterBounds(studyArea)
+    .select('swe')
+    .mean()
+    .rename('SWE_winter_mean_mm');
+  
+  return tmean.addBands(ddt).addBands(ddf).addBands(ft_ratio)
+    .addBands(precip).addBands(swe_mean).addBands(swe_max)
+    .addBands(snowDays).addBands(sweWinter);
+};
+
+// MODIS LST
+var getMODIS_LST = function(year) {
+  year = ee.Number(year);
+  
+  var summerLST = ee.ImageCollection('MODIS/006/MOD11A2')
+    .filterDate(ee.Date.fromYMD(year, 6, 1), ee.Date.fromYMD(year, 8, 31))
+    .filterBounds(studyArea)
+    .select('LST_Day_1km');
+  
+  var winterLST = ee.ImageCollection('MODIS/006/MOD11A2')
+    .filterDate(ee.Date.fromYMD(year, 1, 1), ee.Date.fromYMD(year, 2, 28))
+    .filterBounds(studyArea)
+    .select('LST_Day_1km');
+  
+  var lst_summer = ee.Image(ee.Algorithms.If(
+    summerLST.size().gt(0),
+    summerLST.mean().multiply(0.02).subtract(273.15).rename('LST_summer_C'),
+    createConstantBand('LST_summer_C', -9999)
+  ));
+  
+  var lst_winter = ee.Image(ee.Algorithms.If(
+    winterLST.size().gt(0),
+    winterLST.mean().multiply(0.02).subtract(273.15).rename('LST_winter_C'),
+    createConstantBand('LST_winter_C', -9999)
+  ));
+  
+  var lst_amp = ee.Image(ee.Algorithms.If(
+    summerLST.size().gt(0).and(winterLST.size().gt(0)),
+    ee.Image(lst_summer).subtract(ee.Image(lst_winter)).rename('LST_amplitude_C'),
+    createConstantBand('LST_amplitude_C', -9999)
+  ));
+  
+  return ee.Image(lst_summer).addBands(lst_winter).addBands(lst_amp);
+};
+
+// ------------------------------------------------------------
+// 6. EXTRACT FEATURES FOR ALL YEARS
+// ------------------------------------------------------------
+
+var extractFeaturesForYear = function(year) {
+  year = ee.Number(year);
+  
+  // Build feature stack for this year
+  var yearStack = terrainStack
+    .addBands(getLandcover(year))
+    .addBands(getSummerNDVI(year))
+    .addBands(getMODIS_NDVI(year))
+    .addBands(getDaymetFeatures(year))
+    .addBands(getMODIS_LST(year));
+  
+  // Extract at site locations
+  var extracted = yearStack.reduceRegions({
+    collection: sitesFormatted,
+    reducer: ee.Reducer.first(),
+    scale: 250,
+    tileScale: 4
+  }).map(function(f) {
+    return f.set('Year', year);
+  });
+  
+  return extracted;
+};
+
+// Map over all years
+var allYearsFeatures = ee.FeatureCollection(
+  years.map(function(year) {
+    return extractFeaturesForYear(year);
+  })
+).flatten();
+
+print('Total site-year records:', allYearsFeatures.size());
+print('Sample record:', allYearsFeatures.first());
+
+// ------------------------------------------------------------
+// 7. EXPORT TO DRIVE
+// ------------------------------------------------------------
+
+Export.table.toDrive({
+  collection: allYearsFeatures,
+  description: 'gtnp_RS_features_2002_2012',
+  folder: 'CircuitBoard',
+  fileNamePrefix: 'gtnp_RS_features_2002_2012',
+  fileFormat: 'CSV',
+  selectors: [
+    'Code', 'Lat', 'Lon', 'Year', 'borehole_id', 'site_name',
+    'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+    'landcover_class',
+    'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
+    'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+    'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
+    'SWE_duration_days', 'SWE_winter_mean_mm',
+    'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C'
+  ]
+});
+
+print('Ready to export - check Tasks tab');
+
+// ------------------------------------------------------------
+// 8. VISUALIZATION
+// ------------------------------------------------------------
+
+// Show MAAT for reference
+var maat2010 = getDaymetFeatures(2010).select('MAAT_C');
+Map.addLayer(maat2010.clip(studyArea), 
+  {min: -12, max: 0, palette: ['blue', 'cyan', 'yellow', 'red']}, 
+  'MAAT 2010', false);
