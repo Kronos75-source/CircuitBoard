@@ -1,0 +1,783 @@
+"""
+Ensemble Model for Permafrost Ground Temperature Prediction
+============================================================
+COMBINED TRAINING: Wang2018 + GTN-P datasets
+
+Combines XGBoost and Random Forest with weighted averaging.
+Target: MAGT_100cm (Mean Annual Ground Temperature at 1m depth)
+Features: Terrain, vegetation, climate, LST from GEE extraction
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+import matplotlib.pyplot as plt
+import joblib
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# --- WANG2018 DATASET ---
+WANG_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Big Game\01_Test\wang2018_RS_features_2000_2016_v3.csv"
+WANG_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Big Game\01_Test\wang2018_annual_summary.csv"
+
+# --- GTN-P DATASET ---
+GTNP_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Circuit Board\02_Test\gtnp_RS_features_2002_2012.csv"
+GTNP_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Circuit Board\02_Test\gtnp_annual_summary.csv"
+
+# --- OUTPUT ---
+OUTPUT_DIR = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Big Game\03_Combined"
+
+
+# =============================================================================
+# 1. LOAD AND MERGE WANG2018 DATA
+# =============================================================================
+
+def load_wang2018(rs_path: str, gt_path: str) -> pd.DataFrame:
+    """Load Wang2018 RS features and ground temperature data."""
+    
+    print("-" * 40)
+    print("Loading Wang2018 dataset...")
+    print("-" * 40)
+    
+    rs = pd.read_csv(rs_path)
+    gt = pd.read_csv(gt_path)
+    
+    rs['Code'] = rs['Code'].astype(str).str.strip()
+    gt['Code'] = gt['Code'].astype(str).str.strip()
+    rs['Year'] = rs['Year'].astype(int)
+    gt['Year'] = gt['Year'].astype(int)
+    
+    # Select columns for merge
+    gt_cols = ['Code', 'Year', 'MAGT_100cm']
+    # Add optional columns if they exist
+    for col in ['MAGT_25cm', 'MAGT_50cm', 'MAGT_75cm', 'MAGST', 'MAAT', 'Lat', 'Lon']:
+        if col in gt.columns:
+            gt_cols.append(col)
+    
+    merged = pd.merge(rs, gt[gt_cols], on=['Code', 'Year'], how='inner')
+    
+    # Add source label
+    merged['source'] = 'Wang2018'
+    
+    print(f"  RS features: {len(rs)} rows")
+    print(f"  Ground temp: {len(gt)} rows")
+    print(f"  Merged: {len(merged)} rows, {merged['Code'].nunique()} sites")
+    
+    return merged
+
+
+# =============================================================================
+# 2. LOAD AND MERGE GTN-P DATA
+# =============================================================================
+
+def load_gtnp(rs_path: str, gt_path: str) -> pd.DataFrame:
+    """Load GTN-P RS features and ground temperature data."""
+    
+    print("-" * 40)
+    print("Loading GTN-P dataset...")
+    print("-" * 40)
+    
+    rs = pd.read_csv(rs_path)
+    gt = pd.read_csv(gt_path)
+    
+    print(f"  RS features: {len(rs)} rows, columns: {list(rs.columns)}")
+    print(f"  Ground temp: {len(gt)} rows, columns: {list(gt.columns)}")
+    
+    rs['Code'] = rs['Code'].astype(str).str.strip()
+    gt['Code'] = gt['Code'].astype(str).str.strip()
+    rs['Year'] = rs['Year'].astype(int)
+    gt['Year'] = gt['Year'].astype(int)
+    
+    # GTN-P ground temp file has different structure - select what we need
+    gt_cols = ['Code', 'Year', 'MAGT_100cm']
+    # Add Lat/Lon if available (might be in RS file instead)
+    for col in ['latitude', 'longitude', 'Lat', 'Lon']:
+        if col in gt.columns:
+            gt_cols.append(col)
+    
+    gt_subset = gt[gt_cols].copy()
+    
+    # Drop rows without MAGT_100cm
+    gt_subset = gt_subset.dropna(subset=['MAGT_100cm'])
+    
+    merged = pd.merge(rs, gt_subset, on=['Code', 'Year'], how='inner')
+    
+    # Standardize Lat/Lon column names
+    if 'latitude' in merged.columns and 'Lat' not in merged.columns:
+        merged['Lat'] = merged['latitude']
+    if 'longitude' in merged.columns and 'Lon' not in merged.columns:
+        merged['Lon'] = merged['longitude']
+    
+    # Add source label
+    merged['source'] = 'GTN-P'
+    
+    print(f"  Merged: {len(merged)} rows, {merged['Code'].nunique()} sites")
+    
+    return merged
+
+
+# =============================================================================
+# 3. COMBINE DATASETS
+# =============================================================================
+
+def combine_datasets(wang_df: pd.DataFrame, gtnp_df: pd.DataFrame) -> pd.DataFrame:
+    """Combine Wang2018 and GTN-P datasets with consistent columns."""
+    
+    print("\n" + "=" * 60)
+    print("COMBINING DATASETS")
+    print("=" * 60)
+    
+    # Define the columns we need
+    required_cols = [
+        'Code', 'Year', 'Lat', 'Lon', 'source',
+        'MAGT_100cm',
+        'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+        'landcover_class',
+        'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
+        'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+        'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
+        'SWE_duration_days', 'SWE_winter_mean_mm',
+        'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C'
+    ]
+    
+    # Select columns that exist in each dataset
+    wang_cols = [c for c in required_cols if c in wang_df.columns]
+    gtnp_cols = [c for c in required_cols if c in gtnp_df.columns]
+    
+    wang_subset = wang_df[wang_cols].copy()
+    gtnp_subset = gtnp_df[gtnp_cols].copy()
+    
+    # Combine
+    combined = pd.concat([wang_subset, gtnp_subset], ignore_index=True)
+    
+    print(f"\nWang2018: {len(wang_subset)} rows, {wang_subset['Code'].nunique()} sites")
+    print(f"GTN-P:    {len(gtnp_subset)} rows, {gtnp_subset['Code'].nunique()} sites")
+    print(f"Combined: {len(combined)} rows, {combined['Code'].nunique()} sites")
+    print(f"Year range: {combined['Year'].min()} - {combined['Year'].max()}")
+    
+    # Check for column mismatches
+    missing_wang = set(required_cols) - set(wang_cols)
+    missing_gtnp = set(required_cols) - set(gtnp_cols)
+    if missing_wang:
+        print(f"\nWarning - Wang2018 missing columns: {missing_wang}")
+    if missing_gtnp:
+        print(f"Warning - GTN-P missing columns: {missing_gtnp}")
+    
+    return combined
+
+
+# =============================================================================
+# 4. PREPARE FEATURES
+# =============================================================================
+
+def prepare_features(df: pd.DataFrame) -> tuple:
+    """Clean data and prepare feature matrix X and target y."""
+    
+    print("\n" + "=" * 60)
+    print("PREPARING FEATURES")
+    print("=" * 60)
+    
+    feature_cols = [
+        'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+        'landcover_class',
+        'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
+        'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+        'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
+        'SWE_duration_days', 'SWE_winter_mean_mm',
+        'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C'
+    ]
+    
+    available_features = [c for c in feature_cols if c in df.columns]
+    print(f"Available features: {len(available_features)}")
+    
+    target_col = 'MAGT_100cm'
+    data = df.copy()
+    
+    # Clean missing values
+    for col in available_features + [target_col]:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+            data[col] = data[col].replace(-9999, np.nan)
+            data[col] = data[col].replace(-999.99, np.nan)
+    
+    # Count before dropping
+    n_before = len(data)
+    n_with_target = data[target_col].notna().sum()
+    
+    data = data.dropna(subset=[target_col])
+    data = data.dropna(subset=available_features)
+    
+    print(f"Rows with MAGT_100cm: {n_with_target}")
+    print(f"Complete cases: {len(data)}")
+    
+    # Report by source
+    for src in data['source'].unique():
+        n = len(data[data['source'] == src])
+        sites = data[data['source'] == src]['Code'].nunique()
+        print(f"  {src}: {n} rows, {sites} sites")
+    
+    X = data[available_features].values.astype(np.float64)
+    y = data[target_col].values
+    
+    print(f"\nFinal X shape: {X.shape}")
+    print(f"Target range: {y.min():.2f} to {y.max():.2f} °C")
+    
+    return X, y, available_features, data
+
+
+# =============================================================================
+# 5. DEFINE MODELS
+# =============================================================================
+
+def get_xgboost():
+    return xgb.XGBRegressor(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        random_state=42,
+        n_jobs=-1
+    )
+
+def get_randomforest():
+    return RandomForestRegressor(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_split=5,
+        min_samples_leaf=3,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=-1
+    )
+
+
+# =============================================================================
+# 6. CROSS-VALIDATION WITH ENSEMBLE
+# =============================================================================
+
+def run_ensemble_cv(X: np.ndarray, y: np.ndarray,
+                    feature_names: list, df: pd.DataFrame,
+                    n_splits: int = 5) -> dict:
+    """
+    Run grouped cross-validation for each model and the ensemble.
+    Calculates optimal weights based on inverse RMSE.
+    """
+    
+    print("\n" + "=" * 60)
+    print("ENSEMBLE CROSS-VALIDATION")
+    print("=" * 60)
+    
+    groups = df['Code'].values
+    unique_sites = df['Code'].nunique()
+    n_splits = min(n_splits, unique_sites)
+    
+    print(f"Sites: {unique_sites}, Folds: {n_splits}")
+    
+    group_kfold = GroupKFold(n_splits=n_splits)
+    
+    # Storage for results
+    model_names = ['XGBoost', 'RandomForest', 'Ensemble_Equal', 'Ensemble_Weighted']
+    results = {name: {'r2': [], 'rmse': [], 'mae': []} for name in model_names}
+    
+    # Track RMSE for weight calculation
+    all_rmse_xgb = []
+    all_rmse_rf = []
+    
+    fold = 1
+    for train_idx, test_idx in group_kfold.split(X, y, groups):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        n_sites_test = len(set(groups[test_idx]))
+        print(f"\n--- Fold {fold} ({n_sites_test} sites held out) ---")
+        
+        # XGBoost
+        model_xgb = get_xgboost()
+        model_xgb.fit(X_train, y_train)
+        y_pred_xgb = model_xgb.predict(X_test)
+        
+        r2 = r2_score(y_test, y_pred_xgb)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred_xgb))
+        mae = mean_absolute_error(y_test, y_pred_xgb)
+        results['XGBoost']['r2'].append(r2)
+        results['XGBoost']['rmse'].append(rmse)
+        results['XGBoost']['mae'].append(mae)
+        all_rmse_xgb.append(rmse)
+        print(f"  {'XGBoost':18s}: R²={r2:.3f}, RMSE={rmse:.2f}°C, MAE={mae:.2f}°C")
+        
+        # Random Forest
+        model_rf = get_randomforest()
+        model_rf.fit(X_train, y_train)
+        y_pred_rf = model_rf.predict(X_test)
+        
+        r2 = r2_score(y_test, y_pred_rf)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+        mae = mean_absolute_error(y_test, y_pred_rf)
+        results['RandomForest']['r2'].append(r2)
+        results['RandomForest']['rmse'].append(rmse)
+        results['RandomForest']['mae'].append(mae)
+        all_rmse_rf.append(rmse)
+        print(f"  {'RandomForest':18s}: R²={r2:.3f}, RMSE={rmse:.2f}°C, MAE={mae:.2f}°C")
+        
+        # Ensemble: equal weights (0.5, 0.5)
+        y_pred_equal = 0.5 * y_pred_xgb + 0.5 * y_pred_rf
+        
+        r2 = r2_score(y_test, y_pred_equal)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred_equal))
+        mae = mean_absolute_error(y_test, y_pred_equal)
+        results['Ensemble_Equal']['r2'].append(r2)
+        results['Ensemble_Equal']['rmse'].append(rmse)
+        results['Ensemble_Equal']['mae'].append(mae)
+        print(f"  {'Ensemble (50/50)':18s}: R²={r2:.3f}, RMSE={rmse:.2f}°C, MAE={mae:.2f}°C")
+        
+        # Ensemble: inverse RMSE weights (calculated per fold)
+        rmse_xgb_fold = np.sqrt(mean_squared_error(y_test, y_pred_xgb))
+        rmse_rf_fold = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+        
+        inv_rmse_xgb = 1.0 / rmse_xgb_fold
+        inv_rmse_rf = 1.0 / rmse_rf_fold
+        total_inv = inv_rmse_xgb + inv_rmse_rf
+        
+        w_xgb = inv_rmse_xgb / total_inv
+        w_rf = inv_rmse_rf / total_inv
+        
+        y_pred_weighted = w_xgb * y_pred_xgb + w_rf * y_pred_rf
+        
+        r2 = r2_score(y_test, y_pred_weighted)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred_weighted))
+        mae = mean_absolute_error(y_test, y_pred_weighted)
+        results['Ensemble_Weighted']['r2'].append(r2)
+        results['Ensemble_Weighted']['rmse'].append(rmse)
+        results['Ensemble_Weighted']['mae'].append(mae)
+        print(f"  {'Ensemble (weighted)':18s}: R²={r2:.3f}, RMSE={rmse:.2f}°C, MAE={mae:.2f}°C  [XGB:{w_xgb:.2f}, RF:{w_rf:.2f}]")
+        
+        fold += 1
+    
+    # Calculate global weights from mean RMSE across folds
+    mean_rmse_xgb = np.mean(all_rmse_xgb)
+    mean_rmse_rf = np.mean(all_rmse_rf)
+    
+    inv_rmse_xgb = 1.0 / mean_rmse_xgb
+    inv_rmse_rf = 1.0 / mean_rmse_rf
+    total_inv = inv_rmse_xgb + inv_rmse_rf
+    
+    global_weight_xgb = inv_rmse_xgb / total_inv
+    global_weight_rf = inv_rmse_rf / total_inv
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("CROSS-VALIDATION SUMMARY")
+    print("=" * 60)
+    print(f"\n{'Model':<20} {'R²':>12} {'RMSE (°C)':>14} {'MAE (°C)':>14}")
+    print("-" * 62)
+    
+    for name in model_names:
+        r2_mean = np.mean(results[name]['r2'])
+        r2_std = np.std(results[name]['r2'])
+        rmse_mean = np.mean(results[name]['rmse'])
+        rmse_std = np.std(results[name]['rmse'])
+        mae_mean = np.mean(results[name]['mae'])
+        mae_std = np.std(results[name]['mae'])
+        
+        print(f"{name:<20} {r2_mean:>5.3f}±{r2_std:<5.3f} {rmse_mean:>6.2f}±{rmse_std:<5.2f} {mae_mean:>6.2f}±{mae_std:<5.2f}")
+        
+        results[name]['r2_mean'] = r2_mean
+        results[name]['r2_std'] = r2_std
+        results[name]['rmse_mean'] = rmse_mean
+        results[name]['rmse_std'] = rmse_std
+        results[name]['mae_mean'] = mae_mean
+        results[name]['mae_std'] = mae_std
+    
+    results['global_weights'] = {
+        'XGBoost': global_weight_xgb,
+        'RandomForest': global_weight_rf
+    }
+    
+    print(f"\nOptimal weights (inverse RMSE): XGBoost={global_weight_xgb:.3f}, RandomForest={global_weight_rf:.3f}")
+    
+    best_model = max(model_names, key=lambda x: results[x]['r2_mean'])
+    print(f"Best model by R²: {best_model} ({results[best_model]['r2_mean']:.3f})")
+    
+    return results
+
+
+# =============================================================================
+# 7. TRAIN FINAL ENSEMBLE
+# =============================================================================
+
+def train_final_ensemble(X: np.ndarray, y: np.ndarray) -> dict:
+    """Train both models on full dataset for deployment."""
+    
+    print("\n" + "=" * 60)
+    print("TRAINING FINAL ENSEMBLE ON ALL DATA")
+    print("=" * 60)
+    
+    print("Training XGBoost...")
+    model_xgb = get_xgboost()
+    model_xgb.fit(X, y)
+    
+    print("Training RandomForest...")
+    model_rf = get_randomforest()
+    model_rf.fit(X, y)
+    
+    print("All models trained.")
+    
+    return {
+        'XGBoost': model_xgb,
+        'RandomForest': model_rf
+    }
+
+
+# =============================================================================
+# 8. ENSEMBLE PREDICTION CLASS
+# =============================================================================
+
+class WeightedEnsembleModel:
+    """Weighted averaging ensemble wrapper for XGBoost + RandomForest."""
+    
+    def __init__(self, models: dict, weights: dict, feature_names: list):
+        self.models = models
+        self.weights = weights
+        self.feature_names = feature_names
+    
+    def predict(self, X) -> np.ndarray:
+        """Weighted average predictions from both models."""
+        if isinstance(X, pd.DataFrame):
+            X = X.values.astype(np.float64)
+        else:
+            X = X.astype(np.float64)
+        
+        pred_xgb = self.models['XGBoost'].predict(X)
+        pred_rf = self.models['RandomForest'].predict(X)
+        
+        return (self.weights['XGBoost'] * pred_xgb +
+                self.weights['RandomForest'] * pred_rf)
+    
+    def predict_individual(self, X) -> dict:
+        """Get predictions from each model separately."""
+        if isinstance(X, pd.DataFrame):
+            X = X.values.astype(np.float64)
+        else:
+            X = X.astype(np.float64)
+        
+        return {
+            'XGBoost': self.models['XGBoost'].predict(X),
+            'RandomForest': self.models['RandomForest'].predict(X)
+        }
+
+
+# =============================================================================
+# 9. VISUALIZATION
+# =============================================================================
+
+def plot_ensemble_results(ensemble: WeightedEnsembleModel, X: np.ndarray, y: np.ndarray,
+                          df: pd.DataFrame, cv_results: dict, output_dir: str):
+    """Generate diagnostic plots for ensemble."""
+    
+    print("\n" + "=" * 60)
+    print("GENERATING PLOTS")
+    print("=" * 60)
+    
+    y_pred_ensemble = ensemble.predict(X)
+    individual_preds = ensemble.predict_individual(X)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1: XGBoost predictions vs observed
+    ax = axes[0, 0]
+    y_pred = individual_preds['XGBoost']
+    colors = df['source'].map({'Wang2018': 'steelblue', 'GTN-P': 'orange'}).values
+    ax.scatter(y, y_pred, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+    r2 = r2_score(y, y_pred)
+    rmse = np.sqrt(mean_squared_error(y, y_pred))
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'XGBoost\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    
+    # 2: RandomForest predictions vs observed
+    ax = axes[0, 1]
+    y_pred = individual_preds['RandomForest']
+    ax.scatter(y, y_pred, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+    r2 = r2_score(y, y_pred)
+    rmse = np.sqrt(mean_squared_error(y, y_pred))
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'Random Forest\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    
+    # 3: Weighted ensemble predictions vs observed
+    ax = axes[0, 2]
+    ax.scatter(y, y_pred_ensemble, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+    r2 = r2_score(y, y_pred_ensemble)
+    rmse = np.sqrt(mean_squared_error(y, y_pred_ensemble))
+    w_xgb = ensemble.weights['XGBoost']
+    w_rf = ensemble.weights['RandomForest']
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'Weighted Ensemble (XGB:{w_xgb:.2f}, RF:{w_rf:.2f})\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='steelblue', label='Wang2018'),
+                       Patch(facecolor='orange', label='GTN-P')]
+    ax.legend(handles=legend_elements, loc='lower right')
+    
+    # 4: CV performance comparison
+    ax = axes[1, 0]
+    model_names = ['XGBoost', 'RandomForest', 'Ensemble_Equal', 'Ensemble_Weighted']
+    display_names = ['XGBoost', 'RandomForest', 'Equal (50/50)', 'Weighted']
+    r2_means = [cv_results[name]['r2_mean'] for name in model_names]
+    r2_stds = [cv_results[name]['r2_std'] for name in model_names]
+    bar_colors = ['steelblue', 'forestgreen', 'gray', 'crimson']
+    
+    bars = ax.bar(display_names, r2_means, yerr=r2_stds, capsize=5, color=bar_colors, alpha=0.8)
+    ax.set_ylabel('R² (Site-Grouped CV)')
+    ax.set_title('Cross-Validation Performance')
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=15, ha='right')
+    
+    for bar, mean in zip(bars, r2_means):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                f'{mean:.3f}', ha='center', va='bottom', fontsize=10)
+    
+    # 5: Residuals by latitude (colored by source)
+    ax = axes[1, 1]
+    residuals = y_pred_ensemble - y
+    ax.scatter(df['Lat'].values, residuals, c=colors, alpha=0.6, edgecolor='k', linewidth=0.3, s=30)
+    ax.axhline(0, color='r', linestyle='--', lw=2)
+    ax.set_xlabel('Latitude (°N)')
+    ax.set_ylabel('Residual (°C)')
+    ax.set_title('Ensemble Residuals by Latitude')
+    ax.grid(True, alpha=0.3)
+    ax.legend(handles=legend_elements, loc='upper right')
+    
+    # 6: Data source comparison
+    ax = axes[1, 2]
+    sources = df['source'].unique()
+    source_stats = []
+    for src in sources:
+        mask = df['source'] == src
+        y_src = y[mask]
+        pred_src = y_pred_ensemble[mask]
+        r2_src = r2_score(y_src, pred_src)
+        n_src = mask.sum()
+        source_stats.append({'source': src, 'r2': r2_src, 'n': n_src})
+    
+    source_names = [s['source'] for s in source_stats]
+    source_r2s = [s['r2'] for s in source_stats]
+    source_ns = [s['n'] for s in source_stats]
+    source_colors = ['steelblue' if s == 'Wang2018' else 'orange' for s in source_names]
+    
+    bars = ax.bar(source_names, source_r2s, color=source_colors, alpha=0.8)
+    ax.set_ylabel('R² (Training Fit)')
+    ax.set_title('Performance by Data Source')
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    for bar, r2_val, n in zip(bars, source_r2s, source_ns):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                f'R²={r2_val:.3f}\nn={n}', ha='center', va='bottom', fontsize=10)
+    
+    plt.tight_layout()
+    
+    output_path = Path(output_dir) / 'ensemble_combined_diagnostic_plots.png'
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved plots to: {output_path}")
+    plt.close()
+
+
+# =============================================================================
+# 10. SAVE RESULTS
+# =============================================================================
+
+def save_ensemble_results(ensemble: WeightedEnsembleModel, cv_results: dict,
+                          X: np.ndarray, y: np.ndarray, df: pd.DataFrame,
+                          feature_names: list, output_dir: str):
+    """Save ensemble model and results."""
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save individual models
+    ensemble.models['XGBoost'].save_model(output_dir / 'ensemble_xgboost.json')
+    joblib.dump(ensemble.models['RandomForest'], output_dir / 'ensemble_randomforest.joblib')
+    
+    # Save weights
+    weights_path = output_dir / 'ensemble_weights.json'
+    with open(weights_path, 'w') as f:
+        json.dump(ensemble.weights, f, indent=2)
+    
+    # Save feature names
+    with open(output_dir / 'feature_names.json', 'w') as f:
+        json.dump(feature_names, f, indent=2)
+    
+    print(f"Saved models and weights to {output_dir}")
+    
+    # Save predictions
+    df_out = df.copy()
+    individual_preds = ensemble.predict_individual(X)
+    for name, preds in individual_preds.items():
+        df_out[f'pred_{name}'] = preds
+    df_out['pred_Ensemble'] = ensemble.predict(X)
+    df_out['residual_Ensemble'] = df_out['pred_Ensemble'] - df_out['MAGT_100cm']
+    
+    predictions_path = output_dir / 'ensemble_combined_predictions.csv'
+    df_out.to_csv(predictions_path, index=False)
+    print(f"Saved predictions to: {predictions_path}")
+    
+    # Save CV summary
+    wang_n = len(df[df['source'] == 'Wang2018'])
+    gtnp_n = len(df[df['source'] == 'GTN-P'])
+    wang_sites = df[df['source'] == 'Wang2018']['Code'].nunique()
+    gtnp_sites = df[df['source'] == 'GTN-P']['Code'].nunique()
+    
+    summary_lines = [
+        "Weighted Ensemble Model (XGBoost + RandomForest)",
+        "COMBINED TRAINING: Wang2018 + GTN-P",
+        "=" * 50,
+        f"Date: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "DATA SUMMARY:",
+        f"  Wang2018: {wang_n} samples, {wang_sites} sites",
+        f"  GTN-P:    {gtnp_n} samples, {gtnp_sites} sites",
+        f"  Total:    {len(y)} samples, {df['Code'].nunique()} sites",
+        "",
+        "Ensemble Weights (Inverse RMSE):",
+        f"  XGBoost:      {ensemble.weights['XGBoost']:.4f}",
+        f"  RandomForest: {ensemble.weights['RandomForest']:.4f}",
+        "",
+        "Site-Grouped CV Results:",
+        "-" * 62,
+        f"{'Model':<20} {'R²':>12} {'RMSE (°C)':>14} {'MAE (°C)':>14}",
+        "-" * 62
+    ]
+    
+    for name in ['XGBoost', 'RandomForest', 'Ensemble_Equal', 'Ensemble_Weighted']:
+        r = cv_results[name]
+        summary_lines.append(
+            f"{name:<20} {r['r2_mean']:>5.3f}±{r['r2_std']:<5.3f} "
+            f"{r['rmse_mean']:>6.2f}±{r['rmse_std']:<5.2f} "
+            f"{r['mae_mean']:>6.2f}±{r['mae_std']:<5.2f}"
+        )
+    
+    summary_lines.extend([
+        "",
+        "Model files:",
+        "  - ensemble_xgboost.json",
+        "  - ensemble_randomforest.joblib",
+        "  - ensemble_weights.json",
+        "  - feature_names.json"
+    ])
+    
+    summary_path = output_dir / 'ensemble_combined_summary.txt'
+    with open(summary_path, 'w') as f:
+        f.write('\n'.join(summary_lines))
+    print(f"Saved summary to: {summary_path}")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    
+    print("\n" + "=" * 60)
+    print("PERMAFROST GROUND TEMPERATURE PREDICTION")
+    print("COMBINED TRAINING: Wang2018 + GTN-P")
+    print("Weighted Ensemble: XGBoost + Random Forest")
+    print("=" * 60)
+    
+    # Check files exist
+    missing = []
+    for path, name in [(WANG_RS_PATH, "Wang2018 RS"), (WANG_GT_PATH, "Wang2018 GT"),
+                       (GTNP_RS_PATH, "GTN-P RS"), (GTNP_GT_PATH, "GTN-P GT")]:
+        if not Path(path).exists():
+            missing.append(f"{name}: {path}")
+    
+    if missing:
+        print("\n❌ Missing files:")
+        for m in missing:
+            print(f"  - {m}")
+        exit(1)
+    
+    # Create output directory
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Load datasets
+        print("\n" + "=" * 60)
+        print("LOADING DATA")
+        print("=" * 60)
+        
+        wang_df = load_wang2018(WANG_RS_PATH, WANG_GT_PATH)
+        gtnp_df = load_gtnp(GTNP_RS_PATH, GTNP_GT_PATH)
+        
+        # Combine datasets
+        combined = combine_datasets(wang_df, gtnp_df)
+        
+        # Prepare features
+        X, y, feature_names, df_clean = prepare_features(combined)
+        
+        # Run cross-validation
+        cv_results = run_ensemble_cv(X, y, feature_names, df_clean)
+        
+        # Train final ensemble
+        trained_models = train_final_ensemble(X, y)
+        
+        # Create weighted ensemble with optimal weights
+        ensemble = WeightedEnsembleModel(
+            models=trained_models,
+            weights=cv_results['global_weights'],
+            feature_names=feature_names
+        )
+        
+        # Plot results
+        plot_ensemble_results(ensemble, X, y, df_clean, cv_results, OUTPUT_DIR)
+        
+        # Save everything
+        save_ensemble_results(ensemble, cv_results, X, y, df_clean, feature_names, OUTPUT_DIR)
+        
+        print("\n" + "=" * 60)
+        print("✓ COMBINED ENSEMBLE TRAINING COMPLETE")
+        print("=" * 60)
+        
+        # Final comparison
+        xgb_r2 = cv_results['XGBoost']['r2_mean']
+        rf_r2 = cv_results['RandomForest']['r2_mean']
+        ens_r2 = cv_results['Ensemble_Weighted']['r2_mean']
+        
+        print(f"\nXGBoost alone:      R² = {xgb_r2:.3f}")
+        print(f"RandomForest alone: R² = {rf_r2:.3f}")
+        print(f"Weighted Ensemble:  R² = {ens_r2:.3f}")
+        print(f"\nWeights: XGBoost={cv_results['global_weights']['XGBoost']:.3f}, "
+              f"RandomForest={cv_results['global_weights']['RandomForest']:.3f}")
+        
+        # Compare to previous
+        print("\n" + "-" * 40)
+        print("COMPARISON TO WANG2018-ONLY MODEL:")
+        print("-" * 40)
+        print(f"Previous R² (Wang2018 only): 0.577")
+        print(f"New R² (Combined):           {ens_r2:.3f}")
+        print(f"Change:                      {ens_r2 - 0.577:+.3f}")
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
