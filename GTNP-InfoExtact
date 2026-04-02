@@ -1,0 +1,471 @@
+"""
+GTN-P Data Processor for Permafrost Model Training
+===================================================
+Processes GTN-P ground temperature data into annual MAGT summaries
+compatible with the ensemble model training pipeline.
+
+Outputs:
+  1. gtnp_annual_summary.csv - Annual MAGT at multiple depths per site
+  2. gtnp_site_metadata.csv  - Site coordinates and info for GEE extraction
+
+Place this script in the same folder as your data files and run in Jupyter.
+
+Author: Generated for Op_Big Game pipeline
+"""
+
+import pandas as pd
+import numpy as np
+import json
+from pathlib import Path
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+import os
+os.chdir(r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Argo\Op_Circuit Board\02_Test")
+print("Working directory:", os.getcwd())
+
+
+# =============================================================================
+# CONFIGURATION - UPDATE THESE PATHS
+# =============================================================================
+
+# Input files (in same folder as this script)
+METADATA_JSON = "pt_metadata.json" 
+TEMP_DATA_CSV = "pt_combined_ground_temperature.csv"  # Use the non-UTC version (has more depth profiles)
+
+# If you want to also use the hourly UTC data, set this:
+TEMP_DATA_UTC_CSV = "pt_combined_ground_temperature_utc.csv"  # Optional, for continuous logger data
+
+# Output files
+OUTPUT_DIR = "."  # Same folder, or change to your preferred output location
+ANNUAL_SUMMARY_OUTPUT = "gtnp_annual_summary.csv"
+SITE_METADATA_OUTPUT = "gtnp_site_metadata.csv"
+PROCESSING_REPORT = "gtnp_processing_report.txt"
+
+# Processing parameters
+TARGET_DEPTHS = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 5.00]  # meters
+DEPTH_TOLERANCE = 0.15  # How close a measurement must be to target depth (meters)
+MIN_DAYS_PER_YEAR = 300  # Minimum days of data to calculate annual mean
+YEAR_RANGE = (2000, 2020)  # Filter to years useful for RS feature matching
+
+
+# =============================================================================
+# 1. LOAD METADATA
+# =============================================================================
+
+def load_metadata(json_path: str) -> pd.DataFrame:
+    """Extract site/borehole info from GTN-P metadata JSON."""
+    
+    print("=" * 60)
+    print("LOADING METADATA")
+    print("=" * 60)
+    
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    records = []
+    for entry in data:
+        bh = entry.get('borehole', {})
+        loc = bh.get('location', {})
+        stats = entry.get('statistics', {})
+        
+        records.append({
+            'dataset_id': entry.get('id'),
+            'borehole_id': bh.get('id'),
+            'borehole_name': bh.get('name'),
+            'site_id': bh.get('site_id'),
+            'site_name': bh.get('site_name'),
+            'latitude': loc.get('latitude'),
+            'longitude': loc.get('longitude'),
+            'elevation_m': loc.get('elevation'),
+            'country': bh.get('country_name'),
+            'date_start': stats.get('date_start'),
+            'date_end': stats.get('date_end'),
+            'max_depth': stats.get('max_depth'),
+            'data_points': stats.get('data_points'),
+            'frequency': entry.get('frequency'),
+            'quality': entry.get('quality'),
+            'gtnp_code': bh.get('gtnp_code')
+        })
+    
+    df_meta = pd.DataFrame(records)
+    
+    print(f"Loaded {len(df_meta)} dataset entries")
+    print(f"Unique boreholes: {df_meta['borehole_id'].nunique()}")
+    print(f"Unique sites: {df_meta['site_id'].nunique()}")
+    print(f"Latitude range: {df_meta['latitude'].min():.2f} to {df_meta['latitude'].max():.2f}")
+    print(f"Max depths available: {df_meta['max_depth'].min():.1f}m to {df_meta['max_depth'].max():.1f}m")
+    
+    return df_meta
+
+
+# =============================================================================
+# 2. LOAD TEMPERATURE DATA
+# =============================================================================
+
+def load_temperature_data(csv_path: str, chunksize: int = 500000) -> pd.DataFrame:
+    """Load temperature CSV in chunks (handles very large files)."""
+    
+    print("\n" + "=" * 60)
+    print("LOADING TEMPERATURE DATA")
+    print("=" * 60)
+    print(f"File: {csv_path}")
+    print("Loading in chunks (this may take a while for large files)...")
+    
+    chunks = []
+    total_rows = 0
+    
+    for i, chunk in enumerate(pd.read_csv(csv_path, chunksize=chunksize)):
+        chunks.append(chunk)
+        total_rows += len(chunk)
+        if (i + 1) % 10 == 0:
+            print(f"  Loaded {total_rows:,} rows...")
+    
+    df = pd.concat(chunks, ignore_index=True)
+    
+    print(f"\nTotal rows loaded: {len(df):,}")
+    print(f"Columns: {list(df.columns)}")
+    print(f"Depth range: {df['depth'].min():.2f}m to {df['depth'].max():.2f}m")
+    print(f"Temperature range: {df['temperature'].min():.2f}°C to {df['temperature'].max():.2f}°C")
+    
+    return df
+
+
+# =============================================================================
+# 3. PROCESS TO ANNUAL MAGT
+# =============================================================================
+
+def process_to_annual_magt(df_temp: pd.DataFrame, df_meta: pd.DataFrame,
+                           target_depths: list, depth_tolerance: float,
+                           min_days: int, year_range: tuple) -> pd.DataFrame:
+    """
+    Aggregate temperature data to annual means at target depths.
+    
+    For each borehole + year + target_depth:
+      1. Find measurements within depth_tolerance of target
+      2. Calculate daily means (if hourly data)
+      3. Calculate annual mean if >= min_days of data
+    """
+    
+    print("\n" + "=" * 60)
+    print("PROCESSING TO ANNUAL MAGT")
+    print("=" * 60)
+    
+    # Parse dates
+    if 'date' in df_temp.columns:
+        df_temp['date'] = pd.to_datetime(df_temp['date'], errors='coerce')
+    elif 'local_time' in df_temp.columns:
+        df_temp['date'] = pd.to_datetime(df_temp['local_time'], errors='coerce')
+    elif 'utc_time' in df_temp.columns:
+        df_temp['date'] = pd.to_datetime(df_temp['utc_time'], errors='coerce')
+    
+    df_temp = df_temp.dropna(subset=['date'])
+    df_temp['year'] = df_temp['date'].dt.year
+    df_temp['doy'] = df_temp['date'].dt.dayofyear
+    
+    # Filter year range
+    df_temp = df_temp[(df_temp['year'] >= year_range[0]) & 
+                      (df_temp['year'] <= year_range[1])]
+    
+    print(f"Records in year range {year_range}: {len(df_temp):,}")
+    
+    # Remove obviously bad temperature values
+    df_temp = df_temp[(df_temp['temperature'] > -50) & 
+                      (df_temp['temperature'] < 30)]
+    
+    print(f"Records after temperature QC: {len(df_temp):,}")
+    
+    # Create borehole lookup for coordinates
+    bh_coords = df_meta.drop_duplicates('borehole_id').set_index('borehole_id')[
+        ['site_id', 'site_name', 'borehole_name', 'latitude', 'longitude', 'elevation_m']
+    ].to_dict('index')
+    
+    # Process each target depth
+    all_results = []
+    
+    for target_depth in target_depths:
+        print(f"\nProcessing depth {target_depth}m (±{depth_tolerance}m)...")
+        
+        # Filter to measurements near this depth
+        depth_mask = (df_temp['depth'] >= target_depth - depth_tolerance) & \
+                     (df_temp['depth'] <= target_depth + depth_tolerance)
+        df_depth = df_temp[depth_mask].copy()
+        
+        if len(df_depth) == 0:
+            print(f"  No data found at {target_depth}m")
+            continue
+        
+        print(f"  Found {len(df_depth):,} measurements")
+        
+        # Aggregate to daily means first (handles hourly data)
+        daily = df_depth.groupby(['borehole_id', 'site_id', 'year', 'doy']).agg({
+            'temperature': 'mean',
+            'depth': 'mean'
+        }).reset_index()
+        
+        # Then aggregate to annual means
+        annual = daily.groupby(['borehole_id', 'site_id', 'year']).agg({
+            'temperature': ['mean', 'std', 'count'],
+            'depth': 'mean'
+        }).reset_index()
+        
+        annual.columns = ['borehole_id', 'site_id', 'year', 
+                         'magt', 'magt_std', 'n_days', 'actual_depth']
+        
+        # Filter by minimum days
+        annual = annual[annual['n_days'] >= min_days]
+        
+        # Add depth label
+        depth_label = f"{int(target_depth * 100)}cm"
+        annual['depth_label'] = depth_label
+        annual['target_depth_m'] = target_depth
+        
+        print(f"  Annual records with >={min_days} days: {len(annual)}")
+        
+        all_results.append(annual)
+    
+    if not all_results:
+        print("\nNo annual MAGT records generated!")
+        return pd.DataFrame()
+    
+    # Combine all depths
+    df_annual = pd.concat(all_results, ignore_index=True)
+    
+    # Add coordinates from metadata
+    df_annual['latitude'] = df_annual['borehole_id'].map(
+        lambda x: bh_coords.get(x, {}).get('latitude'))
+    df_annual['longitude'] = df_annual['borehole_id'].map(
+        lambda x: bh_coords.get(x, {}).get('longitude'))
+    df_annual['elevation_m'] = df_annual['borehole_id'].map(
+        lambda x: bh_coords.get(x, {}).get('elevation_m'))
+    df_annual['site_name'] = df_annual['borehole_id'].map(
+        lambda x: bh_coords.get(x, {}).get('site_name'))
+    df_annual['borehole_name'] = df_annual['borehole_id'].map(
+        lambda x: bh_coords.get(x, {}).get('borehole_name'))
+    
+    # Create a unique Code for each borehole (for merging with RS features)
+    df_annual['Code'] = 'GTNP_BH' + df_annual['borehole_id'].astype(str)
+    
+    print(f"\n{'=' * 60}")
+    print("ANNUAL MAGT SUMMARY")
+    print(f"{'=' * 60}")
+    print(f"Total annual records: {len(df_annual)}")
+    print(f"Unique boreholes: {df_annual['borehole_id'].nunique()}")
+    print(f"Year range: {df_annual['year'].min()} - {df_annual['year'].max()}")
+    print(f"\nRecords per depth:")
+    print(df_annual.groupby('depth_label').size().to_string())
+    
+    return df_annual
+
+
+# =============================================================================
+# 4. PIVOT TO WIDE FORMAT (MATCHES YOUR MODEL INPUT)
+# =============================================================================
+
+def pivot_to_model_format(df_annual: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot annual data to wide format matching wang2018_annual_summary.csv:
+    One row per Code+Year with columns: MAGT_25cm, MAGT_50cm, MAGT_75cm, MAGT_100cm, etc.
+    """
+    
+    print("\n" + "=" * 60)
+    print("PIVOTING TO MODEL FORMAT")
+    print("=" * 60)
+    
+    # Create MAGT column names
+    df_annual['magt_col'] = 'MAGT_' + df_annual['depth_label']
+    
+    # Pivot
+    df_wide = df_annual.pivot_table(
+        index=['Code', 'year', 'borehole_id', 'site_id', 'site_name', 
+               'borehole_name', 'latitude', 'longitude', 'elevation_m'],
+        columns='magt_col',
+        values='magt',
+        aggfunc='mean'
+    ).reset_index()
+    
+    # Rename year to Year for consistency
+    df_wide = df_wide.rename(columns={'year': 'Year'})
+    
+    # Reorder columns
+    magt_cols = [c for c in df_wide.columns if c.startswith('MAGT_')]
+    id_cols = ['Code', 'Year', 'borehole_id', 'site_id', 'site_name', 
+               'borehole_name', 'latitude', 'longitude', 'elevation_m']
+    id_cols = [c for c in id_cols if c in df_wide.columns]
+    
+    df_wide = df_wide[id_cols + sorted(magt_cols)]
+    
+    print(f"Output shape: {df_wide.shape}")
+    print(f"Columns: {list(df_wide.columns)}")
+    print(f"\nSample rows:")
+    print(df_wide.head(3).to_string())
+    
+    # Check MAGT_100cm coverage (your target)
+    if 'MAGT_100cm' in df_wide.columns:
+        n_with_100cm = df_wide['MAGT_100cm'].notna().sum()
+        print(f"\nRows with MAGT_100cm: {n_with_100cm} ({100*n_with_100cm/len(df_wide):.1f}%)")
+    
+    return df_wide
+
+
+# =============================================================================
+# 5. EXPORT SITE METADATA FOR GEE
+# =============================================================================
+
+def export_site_metadata(df_wide: pd.DataFrame, output_path: str):
+    """Export unique site coordinates for GEE feature extraction."""
+    
+    print("\n" + "=" * 60)
+    print("EXPORTING SITE METADATA FOR GEE")
+    print("=" * 60)
+    
+    # Get unique sites with their coordinate info
+    site_cols = ['Code', 'borehole_id', 'site_id', 'site_name', 
+                 'borehole_name', 'latitude', 'longitude', 'elevation_m']
+    site_cols = [c for c in site_cols if c in df_wide.columns]
+    
+    df_sites = df_wide[site_cols].drop_duplicates('Code')
+    
+    # Add year range per site
+    year_info = df_wide.groupby('Code')['Year'].agg(['min', 'max', 'count'])
+    year_info.columns = ['year_min', 'year_max', 'n_years']
+    df_sites = df_sites.merge(year_info, on='Code', how='left')
+    
+    df_sites.to_csv(output_path, index=False)
+    
+    print(f"Saved {len(df_sites)} unique sites to: {output_path}")
+    print(f"\nThis file contains coordinates for GEE RS feature extraction.")
+    print("Columns:", list(df_sites.columns))
+    
+    return df_sites
+
+
+# =============================================================================
+# 6. GENERATE REPORT
+# =============================================================================
+
+def generate_report(df_wide: pd.DataFrame, df_meta: pd.DataFrame, 
+                    output_path: str, year_range: tuple):
+    """Generate a text report summarizing the processed data."""
+    
+    lines = [
+        "GTN-P Data Processing Report",
+        "=" * 50,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "INPUT DATA",
+        "-" * 50,
+        f"Metadata entries: {len(df_meta)}",
+        f"Unique boreholes in metadata: {df_meta['borehole_id'].nunique()}",
+        "",
+        "OUTPUT DATA",
+        "-" * 50,
+        f"Total site-year records: {len(df_wide)}",
+        f"Unique sites (Code): {df_wide['Code'].nunique()}",
+        f"Year range: {df_wide['Year'].min()} - {df_wide['Year'].max()}",
+        "",
+        "MAGT COVERAGE BY DEPTH",
+        "-" * 50,
+    ]
+    
+    magt_cols = [c for c in df_wide.columns if c.startswith('MAGT_')]
+    for col in sorted(magt_cols):
+        n = df_wide[col].notna().sum()
+        pct = 100 * n / len(df_wide)
+        lines.append(f"  {col}: {n} records ({pct:.1f}%)")
+    
+    lines.extend([
+        "",
+        "GEOGRAPHIC COVERAGE",
+        "-" * 50,
+        f"Latitude range: {df_wide['latitude'].min():.3f} to {df_wide['latitude'].max():.3f}",
+        f"Longitude range: {df_wide['longitude'].min():.3f} to {df_wide['longitude'].max():.3f}",
+        "",
+        "NEXT STEPS",
+        "-" * 50,
+        "1. Use gtnp_site_metadata.csv for GEE RS feature extraction",
+        "2. Extract features for years: " + str(year_range),
+        "3. Merge RS features with gtnp_annual_summary.csv on Code + Year",
+        "4. Combine with existing training data",
+        "5. Retrain ensemble model",
+    ])
+    
+    report = "\n".join(lines)
+    
+    with open(output_path, 'w') as f:
+        f.write(report)
+    
+    print(f"\nSaved processing report to: {output_path}")
+    print("\n" + report)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    """Run the full processing pipeline."""
+    
+    print("\n" + "=" * 60)
+    print("GTN-P DATA PROCESSOR")
+    print("=" * 60)
+    
+    # Check files exist
+    if not Path(METADATA_JSON).exists():
+        print(f"ERROR: Metadata file not found: {METADATA_JSON}")
+        print("Make sure this script is in the same folder as your data files.")
+        return
+    
+    if not Path(TEMP_DATA_CSV).exists():
+        print(f"ERROR: Temperature data not found: {TEMP_DATA_CSV}")
+        return
+    
+    # Create output directory
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    
+    # Load data
+    df_meta = load_metadata(METADATA_JSON)
+    df_temp = load_temperature_data(TEMP_DATA_CSV)
+    
+    # Process to annual MAGT
+    df_annual = process_to_annual_magt(
+        df_temp=df_temp,
+        df_meta=df_meta,
+        target_depths=TARGET_DEPTHS,
+        depth_tolerance=DEPTH_TOLERANCE,
+        min_days=MIN_DAYS_PER_YEAR,
+        year_range=YEAR_RANGE
+    )
+    
+    if len(df_annual) == 0:
+        print("\nNo data processed. Check your input files and parameters.")
+        return
+    
+    # Pivot to model format
+    df_wide = pivot_to_model_format(df_annual)
+    
+    # Save outputs
+    annual_path = Path(OUTPUT_DIR) / ANNUAL_SUMMARY_OUTPUT
+    df_wide.to_csv(annual_path, index=False)
+    print(f"\nSaved annual summary to: {annual_path}")
+    
+    # Export site metadata for GEE
+    sites_path = Path(OUTPUT_DIR) / SITE_METADATA_OUTPUT
+    export_site_metadata(df_wide, sites_path)
+    
+    # Generate report
+    report_path = Path(OUTPUT_DIR) / PROCESSING_REPORT
+    generate_report(df_wide, df_meta, report_path, YEAR_RANGE)
+    
+    print("\n" + "=" * 60)
+    print("PROCESSING COMPLETE")
+    print("=" * 60)
+    print(f"\nOutput files:")
+    print(f"  1. {ANNUAL_SUMMARY_OUTPUT} - Annual MAGT for model training")
+    print(f"  2. {SITE_METADATA_OUTPUT} - Site coordinates for GEE extraction")
+    print(f"  3. {PROCESSING_REPORT} - Summary report")
+
+
+if __name__ == "__main__":
+    main()
