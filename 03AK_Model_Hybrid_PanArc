@@ -194,6 +194,35 @@ def calculate_ttop(df):
 # 3. PREPARE FEATURES
 # =============================================================================
 
+def add_multiyear_averaging(df, window=2):
+    """Add rolling averages for climate features."""
+    
+    print("\n" + "=" * 60)
+    print(f"ADDING {window}-YEAR CLIMATE AVERAGING")
+    print("=" * 60)
+    
+    climate_cols = [
+        'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+        'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
+        'SWE_duration_days', 'SWE_winter_mean_mm',
+        'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C'
+    ]
+    
+    available_cols = [c for c in climate_cols if c in df.columns]
+    print(f"Averaging {len(available_cols)} climate features")
+    
+    df = df.sort_values(['Code', 'Year'])
+    
+    for col in available_cols:
+        new_col = f'{col}_{window}yr'
+        df[new_col] = df.groupby('Code')[col].transform(
+            lambda x: x.rolling(window, min_periods=1).mean()
+        )
+    
+    print(f"Added {len(available_cols)} new features with '{window}yr' suffix")
+    
+    return df, [f'{c}_{window}yr' for c in available_cols]
+
 def prepare_features(df):
     """Prepare features for RF residual learning."""
     
@@ -212,14 +241,14 @@ def prepare_features(df):
     
 # Features
     feature_cols = [
-        'Lat', 'Lon',  # NEW: geographic coordinates
+        'Lat', 'Lon',
         'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+        'organic_carbon_0cm', 'sand_pct', 'clay_pct', 'silt_pct', 'bulk_density',  # NEW: soil
         'landcover_class', 'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
-        'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
-        'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
-        'SWE_duration_days', 'SWE_winter_mean_mm',
-        'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C',
-        'TTOP', 'nt', 'nf'
+        'MAAT_C_2yr', 'DDT_Cdays_2yr', 'DDF_Cdays_2yr', 'FT_ratio_2yr',
+        'precip_mm_annual_2yr', 'SWE_mean_mm_2yr', 'SWE_max_mm_2yr',
+        'SWE_duration_days_2yr', 'SWE_winter_mean_mm_2yr',
+        'LST_summer_C_2yr', 'LST_winter_C_2yr', 'LST_amplitude_C_2yr',
     ]
     
     available_features = [c for c in feature_cols if c in data.columns]
@@ -263,14 +292,53 @@ def get_randomforest():
     """Tuned RandomForest for residual prediction."""
     return RandomForestRegressor(
         n_estimators=300,
-        max_depth=12,
+        max_depth=8,           # Changed from 12
         min_samples_split=4,
-        min_samples_leaf=2,
+        min_samples_leaf=4,    # Changed from 2
         max_features='sqrt',
         random_state=42,
         n_jobs=-1
     )
 
+# =============================================================================
+# 4b. HYPERPARAMETER TUNING
+# =============================================================================
+
+def tune_hyperparameters(X, y_residual, groups, n_splits=5):
+    """Grid search with GroupKFold for RF hyperparameters."""
+    
+    print("\n" + "=" * 60)
+    print("HYPERPARAMETER TUNING")
+    print("=" * 60)
+    
+    from sklearn.model_selection import GridSearchCV, GroupKFold
+    
+    param_grid = {
+        'n_estimators': [200, 300, 500],
+        'max_depth': [8, 12, 16, 20],
+        'min_samples_split': [2, 4, 6],
+        'min_samples_leaf': [1, 2, 4],
+    }
+    
+    rf = RandomForestRegressor(max_features='sqrt', random_state=42, n_jobs=-1)
+    
+    group_kfold = GroupKFold(n_splits=n_splits)
+    
+    grid_search = GridSearchCV(
+        rf, 
+        param_grid, 
+        cv=group_kfold.split(X, y_residual, groups),
+        scoring='r2',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    grid_search.fit(X, y_residual)
+    
+    print(f"\nBest parameters: {grid_search.best_params_}")
+    print(f"Best CV R²: {grid_search.best_score_:.3f}")
+    
+    return grid_search.best_params_    
 
 # =============================================================================
 # 5. CROSS-VALIDATION
@@ -711,13 +779,14 @@ if __name__ == "__main__":
     try:
         df = load_data()
         df = calculate_ttop(df)
+        df, avg_features = add_multiyear_averaging(df, window=2)
         X, y_residual, y_magt, ttop, feature_names, df_clean = prepare_features(df)
         cv_results = run_cv(X, y_residual, y_magt, ttop, df_clean)
         rf_model = train_final_model(X, y_residual)
         hybrid_model = HybridTTOPRandomForest(rf_model, feature_names)
         plot_results(hybrid_model, X, y_magt, ttop, df_clean, cv_results, feature_names, OUTPUT_DIR)
         save_model(hybrid_model, cv_results, X, y_magt, ttop, df_clean, feature_names, OUTPUT_DIR)
-        
+
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback
