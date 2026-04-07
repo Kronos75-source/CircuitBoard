@@ -210,8 +210,9 @@ def prepare_features(df):
     print(f"  Mean: {data['residual'].mean():.2f}°C (TTOP bias)")
     print(f"  Std:  {data['residual'].std():.2f}°C")
     
-    # Features
+# Features
     feature_cols = [
+        'Lat', 'Lon',  # NEW: geographic coordinates
         'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
         'landcover_class', 'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
         'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
