@@ -1,0 +1,723 @@
+"""
+FINAL PRODUCTION MODEL: Hybrid TTOP + RandomForest (Pan-Arctic)
+===============================================================
+Extended with Pan-Arctic GTN-P data from Asia/Europe
+
+Workflow:
+1. Calculate TTOP v1 (physics baseline)
+2. Train RandomForest to predict residuals (MAGT - TTOP)
+3. Final prediction: MAGT = TTOP + RF_residual
+
+Data sources:
+- Wang2018 (Alaska)
+- GTN-P Alaska (2002-2012)
+- GTN-P Pan-Arctic (2002-2016) - NEW
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import joblib
+import json
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Existing data
+WANG_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Big Game\01_Test\wang2018_RS_features_2000_2016_v3.csv"
+WANG_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Big Game\01_Test\wang2018_annual_summary.csv"
+GTNP_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Circuit Board\02_Test\gtnp_RS_features_2002_2012.csv"
+GTNP_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Circuit Board\02_Test\gtnp_annual_summary.csv"
+
+# NEW: Pan-Arctic data
+PANARCTIC_RS_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Circuit Board\04_Test_PanArctic_Data\gtnp_panarctic_RS_features_2002_2016.csv"
+PANARCTIC_GT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Circuit Board\04_Test_PanArctic_Data\gtnp_annual_summary.csv"
+
+OUTPUT_DIR = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Big Game\08_Final_Hybrid_RF_PanArctic"
+
+
+# =============================================================================
+# 1. LOAD DATA
+# =============================================================================
+
+def load_single_dataset(rs_path, gt_path, source_name, gt_lat_col='Lat', gt_lon_col='Lon'):
+    """Load and merge a single RS + ground truth dataset."""
+    
+    rs = pd.read_csv(rs_path)
+    gt = pd.read_csv(gt_path)
+    
+    rs['Code'] = rs['Code'].astype(str).str.strip()
+    gt['Code'] = gt['Code'].astype(str).str.strip()
+    
+    # Drop rows without MAGT_100cm
+    gt = gt.dropna(subset=['MAGT_100cm'])
+    
+    # Build ground truth columns to merge
+    gt_cols = ['Code', 'Year', 'MAGT_100cm']
+    
+    # Handle various lat/lon column names
+    for col in ['Lat', 'latitude', 'lat']:
+        if col in gt.columns and 'Lat' not in gt_cols:
+            gt = gt.rename(columns={col: 'Lat'})
+            gt_cols.append('Lat')
+            break
+    
+    for col in ['Lon', 'longitude', 'lon']:
+        if col in gt.columns and 'Lon' not in gt_cols:
+            gt = gt.rename(columns={col: 'Lon'})
+            gt_cols.append('Lon')
+            break
+    
+    # Merge RS features with ground truth
+    merged = pd.merge(rs, gt[gt_cols], on=['Code', 'Year'], how='inner')
+    
+    # If Lat/Lon came from RS instead of GT, keep them
+    if 'Lat' not in merged.columns:
+        for col in ['Lat', 'latitude']:
+            if col in rs.columns:
+                merged['Lat'] = rs[col]
+                break
+    
+    if 'Lon' not in merged.columns:
+        for col in ['Lon', 'longitude']:
+            if col in rs.columns:
+                merged['Lon'] = rs[col]
+                break
+    
+    merged['source'] = source_name
+    
+    return merged
+
+
+def load_data():
+    """Load and combine all datasets."""
+    
+    print("=" * 60)
+    print("LOADING DATA")
+    print("=" * 60)
+    
+    datasets = []
+    
+    # 1. Wang2018 (Alaska)
+    wang = load_single_dataset(WANG_RS_PATH, WANG_GT_PATH, 'Wang2018')
+    print(f"Wang2018:      {len(wang):4d} rows, {wang['Code'].nunique():3d} sites")
+    datasets.append(wang)
+    
+    # 2. GTN-P Alaska
+    gtnp_ak = load_single_dataset(GTNP_RS_PATH, GTNP_GT_PATH, 'GTN-P_Alaska')
+    print(f"GTN-P Alaska:  {len(gtnp_ak):4d} rows, {gtnp_ak['Code'].nunique():3d} sites")
+    datasets.append(gtnp_ak)
+    
+    # 3. NEW: Pan-Arctic GTN-P
+    panarctic = load_single_dataset(PANARCTIC_RS_PATH, PANARCTIC_GT_PATH, 'GTN-P_PanArctic')
+    print(f"GTN-P PanArctic: {len(panarctic):4d} rows, {panarctic['Code'].nunique():3d} sites")
+    datasets.append(panarctic)
+    
+    # Combine all
+    combined = pd.concat(datasets, ignore_index=True)
+    
+    # Remove any duplicate Code-Year combinations (prefer earlier sources)
+    combined = combined.drop_duplicates(subset=['Code', 'Year'], keep='first')
+    
+    print("-" * 60)
+    print(f"COMBINED:      {len(combined):4d} rows, {combined['Code'].nunique():3d} sites")
+    
+    # Geographic summary
+    print(f"\nGeographic coverage:")
+    print(f"  Latitude:  {combined['Lat'].min():.1f}°N to {combined['Lat'].max():.1f}°N")
+    print(f"  Longitude: {combined['Lon'].min():.1f}°E to {combined['Lon'].max():.1f}°E")
+    
+    # Source breakdown
+    print(f"\nBy source:")
+    for src in combined['source'].unique():
+        subset = combined[combined['source'] == src]
+        print(f"  {src}: {len(subset)} rows, {subset['Code'].nunique()} sites, "
+              f"Lat {subset['Lat'].min():.1f}-{subset['Lat'].max():.1f}°N")
+    
+    return combined
+
+
+# =============================================================================
+# 2. CALCULATE TTOP
+# =============================================================================
+
+def calculate_ttop(df):
+    """
+    TTOP v1: Classic Smith & Riseborough formulation
+    TTOP = (nt * DDT - nf * DDF) / P
+    """
+    
+    print("\n" + "=" * 60)
+    print("CALCULATING TTOP (Physics Baseline)")
+    print("=" * 60)
+    
+    data = df.copy()
+    
+    # Clean required columns
+    for col in ['DDT_Cdays', 'DDF_Cdays', 'NDVI_summer_mean', 'SWE_winter_mean_mm']:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+            data[col] = data[col].replace([-9999, -999.99], np.nan)
+    
+    # n-factors
+    ndvi = data['NDVI_summer_mean'].fillna(0.3).clip(0, 1)
+    nt = 1.0 - 0.3 * ndvi
+    
+    swe = data['SWE_winter_mean_mm'].fillna(50)
+    swe_max = swe.max() if swe.max() > 0 else 1
+    nf = 0.7 - 0.3 * (swe / swe_max).clip(0, 1)
+    
+    # TTOP
+    P = 365
+    ttop = (nt * data['DDT_Cdays'] - nf * data['DDF_Cdays']) / P
+    
+    print(f"  n_t (thawing):  mean={nt.mean():.3f}, range=[{nt.min():.3f}, {nt.max():.3f}]")
+    print(f"  n_f (freezing): mean={nf.mean():.3f}, range=[{nf.min():.3f}, {nf.max():.3f}]")
+    print(f"  TTOP range: {ttop.min():.2f} to {ttop.max():.2f}°C")
+    
+    data['TTOP'] = ttop
+    data['nt'] = nt
+    data['nf'] = nf
+    
+    return data
+
+
+# =============================================================================
+# 3. PREPARE FEATURES
+# =============================================================================
+
+def prepare_features(df):
+    """Prepare features for RF residual learning."""
+    
+    print("\n" + "=" * 60)
+    print("PREPARING FEATURES")
+    print("=" * 60)
+    
+    data = df.copy()
+    
+    # Calculate residual
+    data['residual'] = data['MAGT_100cm'] - data['TTOP']
+    
+    print(f"Residual stats:")
+    print(f"  Mean: {data['residual'].mean():.2f}°C (TTOP bias)")
+    print(f"  Std:  {data['residual'].std():.2f}°C")
+    
+    # Features
+    feature_cols = [
+        'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+        'landcover_class', 'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
+        'MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+        'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm',
+        'SWE_duration_days', 'SWE_winter_mean_mm',
+        'LST_summer_C', 'LST_winter_C', 'LST_amplitude_C',
+        'TTOP', 'nt', 'nf'
+    ]
+    
+    available_features = [c for c in feature_cols if c in data.columns]
+    print(f"Features: {len(available_features)}")
+    
+    # Clean
+    for col in available_features + ['residual', 'MAGT_100cm']:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+            data[col] = data[col].replace([-9999, -999.99], np.nan)
+            data[col] = data[col].replace([np.inf, -np.inf], np.nan)
+    
+    # Count before dropping
+    n_before = len(data)
+    
+    data = data.dropna(subset=['residual', 'MAGT_100cm', 'TTOP'])
+    data = data.dropna(subset=available_features)
+    
+    n_after = len(data)
+    print(f"Complete cases: {n_after} (dropped {n_before - n_after} with missing data)")
+    
+    # Breakdown by source
+    print(f"\nBy source:")
+    for src in data['source'].unique():
+        subset = data[data['source'] == src]
+        print(f"  {src}: {len(subset)} rows, {subset['Code'].nunique()} sites")
+    
+    X = data[available_features].values.astype(np.float64)
+    y_residual = data['residual'].values
+    y_magt = data['MAGT_100cm'].values
+    ttop = data['TTOP'].values
+    
+    return X, y_residual, y_magt, ttop, available_features, data
+
+
+# =============================================================================
+# 4. RANDOM FOREST MODEL
+# =============================================================================
+
+def get_randomforest():
+    """Tuned RandomForest for residual prediction."""
+    return RandomForestRegressor(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_split=4,
+        min_samples_leaf=2,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=-1
+    )
+
+
+# =============================================================================
+# 5. CROSS-VALIDATION
+# =============================================================================
+
+def run_cv(X, y_residual, y_magt, ttop, df, n_splits=5):
+    """Cross-validation for Hybrid RF model."""
+    
+    print("\n" + "=" * 60)
+    print("CROSS-VALIDATION")
+    print("=" * 60)
+    
+    groups = df['Code'].values
+    unique_sites = df['Code'].nunique()
+    n_splits = min(n_splits, unique_sites)
+    
+    print(f"Sites: {unique_sites}, Folds: {n_splits}")
+    
+    group_kfold = GroupKFold(n_splits=n_splits)
+    
+    results = {
+        'TTOP_only': {'r2': [], 'rmse': [], 'mae': []},
+        'ML_only': {'r2': [], 'rmse': [], 'mae': []},
+        'Hybrid': {'r2': [], 'rmse': [], 'mae': []}
+    }
+    
+    all_importances = []
+    
+    fold = 1
+    for train_idx, test_idx in group_kfold.split(X, y_residual, groups):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_res_train, y_res_test = y_residual[train_idx], y_residual[test_idx]
+        y_magt_train, y_magt_test = y_magt[train_idx], y_magt[test_idx]
+        ttop_test = ttop[test_idx]
+        
+        n_sites_test = len(set(groups[test_idx]))
+        print(f"\n--- Fold {fold} ({n_sites_test} sites held out) ---")
+        
+        # TTOP only
+        r2 = r2_score(y_magt_test, ttop_test)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, ttop_test))
+        mae = mean_absolute_error(y_magt_test, ttop_test)
+        results['TTOP_only']['r2'].append(r2)
+        results['TTOP_only']['rmse'].append(rmse)
+        results['TTOP_only']['mae'].append(mae)
+        print(f"  {'TTOP only':15s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # ML only
+        model_direct = get_randomforest()
+        model_direct.fit(X_train, y_magt_train)
+        y_pred_direct = model_direct.predict(X_test)
+        
+        r2 = r2_score(y_magt_test, y_pred_direct)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_direct))
+        mae = mean_absolute_error(y_magt_test, y_pred_direct)
+        results['ML_only']['r2'].append(r2)
+        results['ML_only']['rmse'].append(rmse)
+        results['ML_only']['mae'].append(mae)
+        print(f"  {'ML only (RF)':15s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        # Hybrid
+        model_hybrid = get_randomforest()
+        model_hybrid.fit(X_train, y_res_train)
+        res_pred = model_hybrid.predict(X_test)
+        y_pred_hybrid = ttop_test + res_pred
+        
+        r2 = r2_score(y_magt_test, y_pred_hybrid)
+        rmse = np.sqrt(mean_squared_error(y_magt_test, y_pred_hybrid))
+        mae = mean_absolute_error(y_magt_test, y_pred_hybrid)
+        results['Hybrid']['r2'].append(r2)
+        results['Hybrid']['rmse'].append(rmse)
+        results['Hybrid']['mae'].append(mae)
+        print(f"  {'Hybrid (TTOP+RF)':15s}: R²={r2:.3f}, RMSE={rmse:.2f}°C")
+        
+        all_importances.append(model_hybrid.feature_importances_)
+        
+        fold += 1
+    
+    avg_importances = np.mean(all_importances, axis=0)
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("CROSS-VALIDATION SUMMARY")
+    print("=" * 60)
+    print(f"\n{'Model':<18} {'R²':>12} {'RMSE (°C)':>14} {'MAE (°C)':>14}")
+    print("-" * 60)
+    
+    for name, display in [('TTOP_only', 'TTOP only'), 
+                          ('ML_only', 'ML only (RF)'),
+                          ('Hybrid', 'Hybrid TTOP+RF')]:
+        r2_mean = np.mean(results[name]['r2'])
+        r2_std = np.std(results[name]['r2'])
+        rmse_mean = np.mean(results[name]['rmse'])
+        rmse_std = np.std(results[name]['rmse'])
+        mae_mean = np.mean(results[name]['mae'])
+        mae_std = np.std(results[name]['mae'])
+        
+        print(f"{display:<18} {r2_mean:>5.3f}±{r2_std:<5.3f} {rmse_mean:>6.2f}±{rmse_std:<5.2f} {mae_mean:>6.2f}±{mae_std:<5.2f}")
+        
+        results[name]['r2_mean'] = r2_mean
+        results[name]['r2_std'] = r2_std
+        results[name]['rmse_mean'] = rmse_mean
+        results[name]['rmse_std'] = rmse_std
+        results[name]['mae_mean'] = mae_mean
+        results[name]['mae_std'] = mae_std
+    
+    results['feature_importances'] = avg_importances
+    
+    return results
+
+
+# =============================================================================
+# 6. TRAIN FINAL MODEL
+# =============================================================================
+
+def train_final_model(X, y_residual):
+    """Train final RF on all data."""
+    
+    print("\n" + "=" * 60)
+    print("TRAINING FINAL MODEL")
+    print("=" * 60)
+    
+    model = get_randomforest()
+    model.fit(X, y_residual)
+    
+    print("RandomForest trained on full dataset.")
+    print(f"  Trees: {model.n_estimators}")
+    print(f"  Max depth: {model.max_depth}")
+    
+    return model
+
+
+# =============================================================================
+# 7. HYBRID MODEL CLASS
+# =============================================================================
+
+class HybridTTOPRandomForest:
+    """
+    Production hybrid model.
+    Prediction = TTOP + RF_residual
+    """
+    
+    def __init__(self, rf_model, feature_names):
+        self.rf_model = rf_model
+        self.feature_names = feature_names
+    
+    def calculate_ttop_from_features(self, X):
+        """Extract TTOP from feature matrix."""
+        ttop_idx = self.feature_names.index('TTOP')
+        return X[:, ttop_idx]
+    
+    def predict_residual(self, X):
+        """Predict residual (MAGT - TTOP)."""
+        if isinstance(X, pd.DataFrame):
+            X = X[self.feature_names].values.astype(np.float64)
+        return self.rf_model.predict(X)
+    
+    def predict(self, X, ttop=None):
+        """Predict MAGT."""
+        if isinstance(X, pd.DataFrame):
+            X = X[self.feature_names].values.astype(np.float64)
+        
+        if ttop is None:
+            ttop = self.calculate_ttop_from_features(X)
+        
+        residual = self.predict_residual(X)
+        return ttop + residual
+    
+    def get_feature_importance(self):
+        """Get feature importances as DataFrame."""
+        return pd.DataFrame({
+            'feature': self.feature_names,
+            'importance': self.rf_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+
+# =============================================================================
+# 8. VISUALIZATION
+# =============================================================================
+
+def plot_results(model, X, y_magt, ttop, df, cv_results, feature_names, output_dir):
+    """Generate diagnostic plots."""
+    
+    print("\n" + "=" * 60)
+    print("GENERATING PLOTS")
+    print("=" * 60)
+    
+    y_pred = model.predict(X, ttop)
+    residual_pred = model.predict_residual(X)
+    residual_true = y_magt - ttop
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Color mapping for 3 sources
+    source_colors = {
+        'Wang2018': 'steelblue',
+        'GTN-P_Alaska': 'orange',
+        'GTN-P_PanArctic': 'forestgreen'
+    }
+    colors = df['source'].map(source_colors).values
+    
+    # 1: TTOP only
+    ax = axes[0, 0]
+    ax.scatter(y_magt, ttop, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c='gray')
+    ax.plot([y_magt.min(), y_magt.max()], [y_magt.min(), y_magt.max()], 'r--', lw=2)
+    r2 = r2_score(y_magt, ttop)
+    rmse = np.sqrt(mean_squared_error(y_magt, ttop))
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'TTOP Only (Physics)\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    
+    # 2: Hybrid model
+    ax = axes[0, 1]
+    ax.scatter(y_magt, y_pred, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([y_magt.min(), y_magt.max()], [y_magt.min(), y_magt.max()], 'r--', lw=2)
+    r2 = r2_score(y_magt, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_magt, y_pred))
+    ax.set_xlabel('Observed MAGT (°C)')
+    ax.set_ylabel('Predicted MAGT (°C)')
+    ax.set_title(f'Hybrid TTOP + RF\nR²={r2:.3f}, RMSE={rmse:.2f}°C')
+    ax.grid(True, alpha=0.3)
+    
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=c, label=l) for l, c in source_colors.items()]
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=8)
+    
+    # 3: Residual learning
+    ax = axes[0, 2]
+    ax.scatter(residual_true, residual_pred, alpha=0.5, edgecolor='k', linewidth=0.3, s=30, c=colors)
+    ax.plot([residual_true.min(), residual_true.max()], 
+            [residual_true.min(), residual_true.max()], 'r--', lw=2)
+    r2_res = r2_score(residual_true, residual_pred)
+    ax.set_xlabel('True Residual (MAGT - TTOP) °C')
+    ax.set_ylabel('Predicted Residual °C')
+    ax.set_title(f'Residual Learning\nR²={r2_res:.3f}')
+    ax.grid(True, alpha=0.3)
+    
+    # 4: Model comparison
+    ax = axes[1, 0]
+    models = ['TTOP_only', 'ML_only', 'Hybrid']
+    display = ['TTOP Only', 'ML Only', 'Hybrid']
+    r2_means = [cv_results[m]['r2_mean'] for m in models]
+    r2_stds = [cv_results[m]['r2_std'] for m in models]
+    bar_colors = ['gray', 'steelblue', 'crimson']
+    
+    bars = ax.bar(display, r2_means, yerr=r2_stds, capsize=5, color=bar_colors, alpha=0.8)
+    ax.set_ylabel('R² (Site-Grouped CV)')
+    ax.set_title('Model Comparison (CV)')
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    for bar, mean in zip(bars, r2_means):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                f'{mean:.3f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+    
+    # 5: Feature importance
+    ax = axes[1, 1]
+    imp_df = model.get_feature_importance().head(15)
+    y_pos = np.arange(len(imp_df))
+    ax.barh(y_pos, imp_df['importance'], color='forestgreen', alpha=0.8)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(imp_df['feature'])
+    ax.invert_yaxis()
+    ax.set_xlabel('Importance')
+    ax.set_title('Top 15 Features')
+    ax.grid(True, alpha=0.3, axis='x')
+    
+    # 6: Error by latitude (shows Pan-Arctic spread)
+    ax = axes[1, 2]
+    errors = y_pred - y_magt
+    ax.scatter(df['Lat'].values, errors, c=colors, alpha=0.5, edgecolor='k', linewidth=0.3, s=30)
+    ax.axhline(0, color='r', linestyle='--', lw=2)
+    ax.set_xlabel('Latitude (°N)')
+    ax.set_ylabel('Error (°C)')
+    ax.set_title('Prediction Error by Latitude')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    output_path = Path(output_dir) / 'final_hybrid_rf_panarctic_results.png'
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved plots to: {output_path}")
+    plt.close()
+    
+    # Additional plot: Geographic distribution
+    fig, ax = plt.subplots(figsize=(12, 6))
+    scatter = ax.scatter(df['Lon'].values, df['Lat'].values, 
+                         c=y_magt, cmap='RdBu_r', 
+                         s=50, edgecolor='k', linewidth=0.5, alpha=0.7,
+                         vmin=-10, vmax=2)
+    ax.set_xlabel('Longitude (°E)')
+    ax.set_ylabel('Latitude (°N)')
+    ax.set_title('Site Distribution (colored by MAGT)')
+    plt.colorbar(scatter, label='MAGT (°C)')
+    ax.grid(True, alpha=0.3)
+    
+    output_path = Path(output_dir) / 'site_distribution_panarctic.png'
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved site map to: {output_path}")
+    plt.close()
+
+
+# =============================================================================
+# 9. SAVE MODEL
+# =============================================================================
+
+def save_model(model, cv_results, X, y_magt, ttop, df, feature_names, output_dir):
+    """Save final model and results."""
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    joblib.dump(model.rf_model, output_dir / 'hybrid_rf_model_panarctic.joblib')
+    
+    with open(output_dir / 'feature_names.json', 'w') as f:
+        json.dump(feature_names, f, indent=2)
+    
+    print(f"Saved model to: {output_dir / 'hybrid_rf_model_panarctic.joblib'}")
+    
+    y_pred = model.predict(X, ttop)
+    
+    df_out = df.copy()
+    df_out['TTOP'] = ttop
+    df_out['MAGT_pred'] = y_pred
+    df_out['residual_true'] = y_magt - ttop
+    df_out['residual_pred'] = model.predict_residual(X)
+    df_out['error'] = y_pred - y_magt
+    
+    df_out.to_csv(output_dir / 'final_predictions_panarctic.csv', index=False)
+    print(f"Saved predictions to: {output_dir / 'final_predictions_panarctic.csv'}")
+    
+    model.get_feature_importance().to_csv(output_dir / 'feature_importance.csv', index=False)
+    
+    r2_train = r2_score(y_magt, y_pred)
+    rmse_train = np.sqrt(mean_squared_error(y_magt, y_pred))
+    
+    # Source counts
+    source_counts = df['source'].value_counts()
+    source_sites = df.groupby('source')['Code'].nunique()
+    
+    summary = f"""
+================================================================================
+FINAL MODEL: Hybrid TTOP + RandomForest (Pan-Arctic)
+================================================================================
+
+MODEL ARCHITECTURE:
+  1. TTOP (physics) provides baseline prediction
+  2. RandomForest learns residuals (MAGT - TTOP)
+  3. Final: MAGT_pred = TTOP + RF_residual
+
+TTOP FORMULATION:
+  TTOP = (nt * DDT - nf * DDF) / 365
+  Where:
+    nt = 1.0 - 0.3 * NDVI (thawing n-factor)
+    nf = 0.7 - 0.3 * (SWE/SWE_max) (freezing n-factor)
+
+RANDOM FOREST:
+  Trees: 300
+  Max depth: 12
+  Features: {len(feature_names)}
+
+DATA SOURCES:
+"""
+    
+    for src in source_counts.index:
+        summary += f"  {src}: {source_counts[src]} samples, {source_sites[src]} sites\n"
+    
+    summary += f"""
+  TOTAL: {len(df)} samples, {df['Code'].nunique()} sites
+
+GEOGRAPHIC COVERAGE:
+  Latitude:  {df['Lat'].min():.1f}°N to {df['Lat'].max():.1f}°N
+  Longitude: {df['Lon'].min():.1f}°E to {df['Lon'].max():.1f}°E
+
+CROSS-VALIDATION RESULTS (Site-Grouped, 5-Fold):
+  TTOP only:     R² = {cv_results['TTOP_only']['r2_mean']:.3f} ± {cv_results['TTOP_only']['r2_std']:.3f}
+  ML only (RF):  R² = {cv_results['ML_only']['r2_mean']:.3f} ± {cv_results['ML_only']['r2_std']:.3f}
+  Hybrid:        R² = {cv_results['Hybrid']['r2_mean']:.3f} ± {cv_results['Hybrid']['r2_std']:.3f}
+
+TRAINING FIT:
+  R² = {r2_train:.3f}
+  RMSE = {rmse_train:.2f}°C
+
+IMPROVEMENT SUMMARY:
+  Previous (Wang2018 + GTN-P Alaska): R² = 0.642
+  + Added Pan-Arctic data:            R² = {cv_results['Hybrid']['r2_mean']:.3f} ({cv_results['Hybrid']['r2_mean'] - 0.642:+.3f})
+
+FILES:
+  - hybrid_rf_model_panarctic.joblib
+  - feature_names.json
+  - final_predictions_panarctic.csv
+  - feature_importance.csv
+  - final_hybrid_rf_panarctic_results.png
+  - site_distribution_panarctic.png
+
+================================================================================
+"""
+    
+    with open(output_dir / 'MODEL_README.txt', 'w') as f:
+        f.write(summary)
+    
+    print(f"Saved summary to: {output_dir / 'MODEL_README.txt'}")
+    print(summary)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    
+    print("\n" + "=" * 60)
+    print("FINAL MODEL: Hybrid TTOP + RandomForest (Pan-Arctic)")
+    print("=" * 60)
+    
+    # Check files
+    missing = []
+    for path, name in [
+        (WANG_RS_PATH, "Wang2018 RS"), 
+        (WANG_GT_PATH, "Wang2018 GT"),
+        (GTNP_RS_PATH, "GTN-P Alaska RS"), 
+        (GTNP_GT_PATH, "GTN-P Alaska GT"),
+        (PANARCTIC_RS_PATH, "Pan-Arctic RS"),
+        (PANARCTIC_GT_PATH, "Pan-Arctic GT")
+    ]:
+        if not Path(path).exists():
+            missing.append(f"{name}: {path}")
+    
+    if missing:
+        print("\n❌ Missing files:")
+        for m in missing:
+            print(f"  - {m}")
+        exit(1)
+    
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        df = load_data()
+        df = calculate_ttop(df)
+        X, y_residual, y_magt, ttop, feature_names, df_clean = prepare_features(df)
+        cv_results = run_cv(X, y_residual, y_magt, ttop, df_clean)
+        rf_model = train_final_model(X, y_residual)
+        hybrid_model = HybridTTOPRandomForest(rf_model, feature_names)
+        plot_results(hybrid_model, X, y_magt, ttop, df_clean, cv_results, feature_names, OUTPUT_DIR)
+        save_model(hybrid_model, cv_results, X, y_magt, ttop, df_clean, feature_names, OUTPUT_DIR)
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
