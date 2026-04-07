@@ -1,0 +1,208 @@
+// ============================================================
+// ALASKA MAGT PREDICTION RASTER - Feature Stack Export
+// ============================================================
+
+// ------------------------------------------------------------
+// 1. DEFINE ALASKA EXTENT
+// ------------------------------------------------------------
+
+var alaska = ee.Geometry.Rectangle([-170, 51, -130, 72]);
+
+Map.centerObject(alaska, 4);
+
+// ------------------------------------------------------------
+// 2. SET PREDICTION YEAR
+// ------------------------------------------------------------
+
+var year = 2016;  // Change as needed
+var year_prev = year - 1;  // For 2-year averaging
+
+// ------------------------------------------------------------
+// 3. TERRAIN FEATURES (Static)
+// ------------------------------------------------------------
+
+var dem = ee.Image('USGS/GMTED2010').select('be75').rename('elevation_m');
+var slope = ee.Terrain.slope(dem).rename('slope_deg');
+var aspect = ee.Terrain.aspect(dem);
+var aspectRad = aspect.multiply(Math.PI / 180);
+var northness = aspectRad.cos().rename('northness');
+var eastness = aspectRad.sin().rename('eastness');
+var tpi = dem.subtract(dem.focal_mean(500, 'circle', 'meters')).rename('TPI_500m');
+var slopeRad = slope.multiply(Math.PI / 180);
+var twi = slopeRad.tan().add(0.001).log().multiply(-1).rename('TWI');
+
+// Lat/Lon as features
+var latLon = ee.Image.pixelLonLat();
+var lat = latLon.select('latitude').rename('Lat');
+var lon = latLon.select('longitude').rename('Lon');
+
+// ------------------------------------------------------------
+// 4. VEGETATION FEATURES
+// ------------------------------------------------------------
+
+var getLandcover = function(yr) {
+  return ee.ImageCollection('MODIS/006/MCD12Q1')
+    .filterDate(ee.Date.fromYMD(yr, 1, 1), ee.Date.fromYMD(yr, 12, 31))
+    .first()
+    .select('LC_Type1')
+    .rename('landcover_class');
+};
+
+var getNDVI = function(yr) {
+  var modis = ee.ImageCollection('MODIS/006/MOD13Q1')
+    .filterDate(ee.Date.fromYMD(yr, 6, 1), ee.Date.fromYMD(yr, 8, 31))
+    .select('NDVI');
+  return modis.mean().multiply(0.0001).rename('NDVI_summer_mean')
+    .addBands(modis.max().multiply(0.0001).rename('NDVI_summer_max'));
+};
+
+var getMODIS_NDVI = function(yr) {
+  return ee.ImageCollection('MODIS/006/MOD13Q1')
+    .filterDate(ee.Date.fromYMD(yr, 6, 1), ee.Date.fromYMD(yr, 8, 31))
+    .select('NDVI')
+    .mean()
+    .multiply(0.0001)
+    .rename('NDVI_MODIS_summer');
+};
+
+// ------------------------------------------------------------
+// 5. CLIMATE FEATURES (Daymet for Alaska)
+// ------------------------------------------------------------
+
+var getDaymetFeatures = function(yr) {
+  var startDate = ee.Date.fromYMD(yr, 1, 1);
+  var endDate = ee.Date.fromYMD(yr, 12, 31);
+  
+  var daymet = ee.ImageCollection('NASA/ORNL/DAYMET_V4')
+    .filterDate(startDate, endDate)
+    .filterBounds(alaska);
+  
+  var tmean = daymet.select('tmax').mean()
+    .add(daymet.select('tmin').mean())
+    .divide(2)
+    .rename('MAAT_C');
+  
+  var dailyMean = daymet.map(function(img) {
+    return img.select('tmax').add(img.select('tmin')).divide(2).rename('tavg');
+  });
+  
+  var ddt = dailyMean.map(function(img) {
+    return img.updateMask(img.gt(0));
+  }).sum().unmask(0).rename('DDT_Cdays');
+  
+  var ddf = dailyMean.map(function(img) {
+    return img.updateMask(img.lt(0)).multiply(-1);
+  }).sum().unmask(0).rename('DDF_Cdays');
+  
+  var ft_ratio = ddt.divide(ddf.add(1)).rename('FT_ratio');
+  
+  var precip = daymet.select('prcp').sum().rename('precip_mm_annual');
+  
+  var swe = daymet.select('swe');
+  var swe_mean = swe.mean().rename('SWE_mean_mm');
+  var swe_max = swe.max().rename('SWE_max_mm');
+  var snowDays = swe.map(function(img) {
+    return img.gt(0);
+  }).sum().rename('SWE_duration_days');
+  
+  var sweWinter = ee.ImageCollection('NASA/ORNL/DAYMET_V4')
+    .filterDate(ee.Date.fromYMD(yr, 1, 1), ee.Date.fromYMD(yr, 3, 31))
+    .filterBounds(alaska)
+    .select('swe')
+    .mean()
+    .rename('SWE_winter_mean_mm');
+  
+  return tmean.addBands(ddt).addBands(ddf).addBands(ft_ratio)
+    .addBands(precip).addBands(swe_mean).addBands(swe_max)
+    .addBands(snowDays).addBands(sweWinter);
+};
+
+// ------------------------------------------------------------
+// 6. LST FEATURES
+// ------------------------------------------------------------
+
+var getLST = function(yr) {
+  var summerLST = ee.ImageCollection('MODIS/006/MOD11A2')
+    .filterDate(ee.Date.fromYMD(yr, 6, 1), ee.Date.fromYMD(yr, 8, 31))
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02).subtract(273.15)
+    .rename('LST_summer_C');
+  
+  var winterLST = ee.ImageCollection('MODIS/006/MOD11A2')
+    .filterDate(ee.Date.fromYMD(yr, 1, 1), ee.Date.fromYMD(yr, 2, 28))
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02).subtract(273.15)
+    .rename('LST_winter_C');
+  
+  var lst_amp = summerLST.subtract(winterLST).rename('LST_amplitude_C');
+  
+  return summerLST.addBands(winterLST).addBands(lst_amp);
+};
+
+// ------------------------------------------------------------
+// 7. BUILD 2-YEAR AVERAGED STACK
+// ------------------------------------------------------------
+
+// Get features for both years
+var climate_yr1 = getDaymetFeatures(year);
+var climate_yr2 = getDaymetFeatures(year_prev);
+var lst_yr1 = getLST(year);
+var lst_yr2 = getLST(year_prev);
+
+// Average the climate bands
+var climateAvg = climate_yr1.add(climate_yr2).divide(2);
+var lstAvg = lst_yr1.add(lst_yr2).divide(2);
+
+// Rename to match model expectations
+var climate2yr = climateAvg.select(['MAAT_C', 'DDT_Cdays', 'DDF_Cdays', 'FT_ratio',
+  'precip_mm_annual', 'SWE_mean_mm', 'SWE_max_mm', 'SWE_duration_days', 'SWE_winter_mean_mm'],
+  ['MAAT_C_2yr', 'DDT_Cdays_2yr', 'DDF_Cdays_2yr', 'FT_ratio_2yr',
+  'precip_mm_annual_2yr', 'SWE_mean_mm_2yr', 'SWE_max_mm_2yr', 'SWE_duration_days_2yr', 'SWE_winter_mean_mm_2yr']);
+
+var lst2yr = lstAvg.select(['LST_summer_C', 'LST_winter_C', 'LST_amplitude_C'],
+  ['LST_summer_C_2yr', 'LST_winter_C_2yr', 'LST_amplitude_C_2yr']);
+
+// ------------------------------------------------------------
+// 8. COMBINE ALL FEATURES
+// ------------------------------------------------------------
+
+var featureStack = lat.addBands(lon)
+  .addBands(dem).addBands(slope).addBands(northness).addBands(eastness)
+  .addBands(tpi).addBands(twi)
+  .addBands(getLandcover(year))
+  .addBands(getNDVI(year).select('NDVI_summer_mean'))
+  .addBands(getNDVI(year).select('NDVI_summer_max'))
+  .addBands(getMODIS_NDVI(year))
+  .addBands(climate2yr)
+  .addBands(lst2yr)
+  .clip(alaska);
+
+print('Feature stack bands:', featureStack.bandNames());
+print('Band count:', featureStack.bandNames().size());
+
+// ------------------------------------------------------------
+// 9. EXPORT
+// ------------------------------------------------------------
+
+Export.image.toDrive({
+  image: featureStack,
+  description: 'alaska_magt_features_2016',
+  folder: 'BigGame',
+  fileNamePrefix: 'alaska_magt_features_2016',
+  region: alaska,
+  scale: 1000,  // 1km resolution
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+print('Ready to export - check Tasks tab');
+
+// ------------------------------------------------------------
+// 10. PREVIEW
+// ------------------------------------------------------------
+
+Map.addLayer(featureStack.select('MAAT_C_2yr'), 
+  {min: -15, max: 5, palette: ['blue', 'cyan', 'yellow', 'red']}, 
+  'MAAT 2-yr avg');
