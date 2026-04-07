@@ -13,14 +13,12 @@ var sites = ee.FeatureCollection('projects/nrt-extent/assets/gtnp_site_metadata'
 print('GTN-P Sites loaded:', sites.size());
 print('Sample site:', sites.first());
 
-// Rename columns to match expected format
+// Extract coordinates FROM GEOMETRY (not from properties)
 var sitesFormatted = sites.map(function(f) {
-  return ee.Feature(ee.Geometry.Point([f.get('longitude'), f.get('latitude')]))
-    .set('Code', f.get('Code'))
-    .set('Lat', f.get('latitude'))
-    .set('Lon', f.get('longitude'))
-    .set('borehole_id', f.get('borehole_id'))
-    .set('site_name', f.get('site_name'));
+  var coords = f.geometry().coordinates();
+  var lon = ee.Number(coords.get(0));
+  var lat = ee.Number(coords.get(1));
+  return f.set('Lat', lat).set('Lon', lon);
 });
 
 Map.centerObject(sites, 3);
@@ -141,7 +139,6 @@ var getERA5Features = function(year) {
     .filterDate(startDate, endDate)
     .filterBounds(studyArea);
   
-  // Check if we have data
   var hasData = era5.size().gt(0);
   
   // Mean annual air temperature (ERA5 uses Kelvin)
@@ -188,7 +185,6 @@ var getERA5Features = function(year) {
   
   var SWE_winter = era5Winter.mean().multiply(1000).rename('SWE_winter_mean_mm');
   
-  // Create empty image for missing data
   var emptyClimate = createConstantBand('MAAT_C', -9999)
     .addBands(createConstantBand('DDT_Cdays', -9999))
     .addBands(createConstantBand('DDF_Cdays', -9999))
@@ -250,15 +246,13 @@ var getMODIS_LST = function(year) {
 var extractFeaturesForYear = function(year) {
   year = ee.Number(year);
   
-  // Build feature stack for this year (using ERA5 instead of Daymet)
   var yearStack = terrainStack
     .addBands(getLandcover(year))
     .addBands(getSummerNDVI(year))
     .addBands(getMODIS_NDVI(year))
-    .addBands(getERA5Features(year))  // <-- ERA5 replaces Daymet
+    .addBands(getERA5Features(year))
     .addBands(getMODIS_LST(year));
   
-  // Extract at site locations
   var extracted = yearStack.reduceRegions({
     collection: sitesFormatted,
     reducer: ee.Reducer.first(),
@@ -288,7 +282,7 @@ print('Sample record:', allYearsFeatures.first());
 Export.table.toDrive({
   collection: allYearsFeatures,
   description: 'gtnp_panarctic_RS_features_2002_2016',
-  folder: 'RedForest',
+  folder: 'CircuitBoard',
   fileNamePrefix: 'gtnp_panarctic_RS_features_2002_2016',
   fileFormat: 'CSV',
   selectors: [
