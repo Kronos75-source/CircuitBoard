@@ -1,0 +1,185 @@
+"""
+Apply trained MAGT model to Alaska raster
+"""
+
+import numpy as np
+import rasterio
+from rasterio.transform import from_bounds
+import joblib
+import json
+from pathlib import Path
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+FEATURE_RASTER = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Circuit Board\04_Test_PanArctic_Data\alaska_magt_features_2016.tif"
+MODEL_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Big Game\08_Final_Hybrid_RF_PanArctic\hybrid_rf_model_panarctic.joblib"
+FEATURE_NAMES_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Big Game\08_Final_Hybrid_RF_PanArctic\feature_names.json"
+OUTPUT_PATH = r"C:\Users\Lord of Cinder\Desktop\Spring 2026\3. Op_Red Forest\Op_Big Game\08_Final_Hybrid_RF_PanArctic\alaska_magt_prediction_2016.tif"
+
+# =============================================================================
+# LOAD MODEL
+# =============================================================================
+
+print("Loading model...")
+rf_model = joblib.load(MODEL_PATH)
+with open(FEATURE_NAMES_PATH, 'r') as f:
+    feature_names = json.load(f)
+
+print(f"Model expects {len(feature_names)} features:")
+print(f"  {feature_names}")
+
+# =============================================================================
+# LOAD RASTER
+# =============================================================================
+
+print("\nLoading feature raster...")
+with rasterio.open(FEATURE_RASTER) as src:
+    raster_data = src.read()  # Shape: (bands, height, width)
+    profile = src.profile
+    band_names = list(src.descriptions) if src.descriptions[0] else None
+    
+print(f"Raster shape: {raster_data.shape}")
+print(f"Raster bands: {band_names}")
+
+# =============================================================================
+# MATCH BAND ORDER TO MODEL FEATURES
+# =============================================================================
+
+# GEE exports bands in order - map to feature names
+# This assumes GEE band order matches the feature_cols order in the export script
+gee_band_order = [
+    'Lat', 'Lon',
+    'elevation_m', 'slope_deg', 'northness', 'eastness', 'TPI_500m', 'TWI',
+    'landcover_class', 'NDVI_summer_mean', 'NDVI_summer_max', 'NDVI_MODIS_summer',
+    'MAAT_C_2yr', 'DDT_Cdays_2yr', 'DDF_Cdays_2yr', 'FT_ratio_2yr',
+    'precip_mm_annual_2yr', 'SWE_mean_mm_2yr', 'SWE_max_mm_2yr', 
+    'SWE_duration_days_2yr', 'SWE_winter_mean_mm_2yr',
+    'LST_summer_C_2yr', 'LST_winter_C_2yr', 'LST_amplitude_C_2yr'
+]
+
+# Build index mapping
+band_indices = []
+for feat in feature_names:
+    if feat in gee_band_order:
+        band_indices.append(gee_band_order.index(feat))
+    elif feat in ['TTOP', 'nt', 'nf']:
+        band_indices.append(None)  # Will calculate
+    else:
+        print(f"  WARNING: Feature '{feat}' not in raster")
+        band_indices.append(None)
+
+# =============================================================================
+# CALCULATE TTOP
+# =============================================================================
+
+print("\nCalculating TTOP...")
+
+# Get required bands
+ndvi_idx = gee_band_order.index('NDVI_summer_mean')
+swe_idx = gee_band_order.index('SWE_winter_mean_mm_2yr')
+ddt_idx = gee_band_order.index('DDT_Cdays_2yr')
+ddf_idx = gee_band_order.index('DDF_Cdays_2yr')
+
+ndvi = raster_data[ndvi_idx]
+swe = raster_data[swe_idx]
+ddt = raster_data[ddt_idx]
+ddf = raster_data[ddf_idx]
+
+# n-factors
+ndvi_clean = np.clip(np.nan_to_num(ndvi, nan=0.3), 0, 1)
+nt = 1.0 - 0.3 * ndvi_clean
+
+swe_clean = np.nan_to_num(swe, nan=50)
+swe_max = np.nanmax(swe_clean) if np.nanmax(swe_clean) > 0 else 1
+nf = 0.7 - 0.3 * np.clip(swe_clean / swe_max, 0, 1)
+
+# TTOP
+ttop = (nt * ddt - nf * ddf) / 365
+
+print(f"  TTOP range: {np.nanmin(ttop):.2f} to {np.nanmax(ttop):.2f}°C")
+
+# =============================================================================
+# PREPARE FEATURE ARRAY
+# =============================================================================
+
+print("\nPreparing feature array...")
+
+n_bands, height, width = raster_data.shape
+n_pixels = height * width
+
+# Build feature matrix
+X = np.zeros((n_pixels, len(feature_names)), dtype=np.float32)
+
+for i, feat in enumerate(feature_names):
+    if feat == 'TTOP':
+        X[:, i] = ttop.flatten()
+    elif feat == 'nt':
+        X[:, i] = nt.flatten()
+    elif feat == 'nf':
+        X[:, i] = nf.flatten()
+    elif feat in gee_band_order:
+        band_idx = gee_band_order.index(feat)
+        X[:, i] = raster_data[band_idx].flatten()
+
+# Handle nodata
+nodata_mask = np.any(np.isnan(X) | np.isinf(X), axis=1)
+X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+
+print(f"  Valid pixels: {(~nodata_mask).sum():,} / {n_pixels:,}")
+
+# =============================================================================
+# PREDICT
+# =============================================================================
+
+print("\nPredicting MAGT...")
+
+# Predict residuals
+residual_pred = rf_model.predict(X)
+
+# Final MAGT = TTOP + residual
+magt_pred = ttop.flatten() + residual_pred
+
+# Apply nodata mask
+magt_pred[nodata_mask] = np.nan
+
+# Reshape to raster
+magt_raster = magt_pred.reshape((height, width))
+
+print(f"  MAGT range: {np.nanmin(magt_raster):.2f} to {np.nanmax(magt_raster):.2f}°C")
+
+# =============================================================================
+# SAVE OUTPUT
+# =============================================================================
+
+print("\nSaving prediction raster...")
+
+profile.update(
+    count=1,
+    dtype='float32',
+    nodata=np.nan
+)
+
+with rasterio.open(OUTPUT_PATH, 'w', **profile) as dst:
+    dst.write(magt_raster.astype(np.float32), 1)
+    dst.set_band_description(1, 'MAGT_predicted_C')
+
+print(f"Saved to: {OUTPUT_PATH}")
+
+# =============================================================================
+# QUICK PLOT
+# =============================================================================
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(12, 8))
+im = ax.imshow(magt_raster, cmap='RdBu_r', vmin=-10, vmax=2)
+ax.set_title('Predicted MAGT (°C) - Alaska 2016')
+plt.colorbar(im, ax=ax, label='MAGT (°C)')
+ax.axis('off')
+
+plot_path = OUTPUT_PATH.replace('.tif', '.png')
+plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+print(f"Saved plot to: {plot_path}")
+plt.show()
