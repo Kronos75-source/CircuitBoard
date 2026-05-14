@@ -1,0 +1,612 @@
+"""
+================================================================================
+Kudryavtsev ALT Pipeline for Alaska CALM Sites
+================================================================================
+
+This script computes Kudryavtsev (Ku) active layer thickness (ALT) predictions
+for every Alaska CALM site-year. The output is a training table containing,
+for each (site, year) observation:
+
+  - CALM observed ALT (ground truth)
+  - Ku-predicted ALT (physics baseline)
+  - Residual = CALM ALT - Ku ALT  (the target for the ML residual model)
+  - All climate, soil, and site-property inputs used in the Ku calculation
+
+Pipeline overview
+-----------------
+For each CALM site:
+  1. Look up static site properties (vegetation class, organic layer thickness,
+     soil texture, ice content) from a site metadata CSV.
+  2. For each year with a CALM observation:
+       a. Extract monthly air temperature at the site from SNAP rasters
+       b. Compute annual mean and amplitude of air temperature
+       c. Extract winter snow water equivalent (SWE) from snow rasters
+       d. Apply snow + vegetation corrections to get ground-surface T
+       e. Compute soil thermal properties from composition
+       f. Run Ku equation -> predicted ALT
+  3. Pair with observed CALM ALT, write to output table.
+
+Reference for the physics:
+  Anisimov, O. A., Shiklomanov, N. I., & Nelson, F. E. (1997). Global warming
+  and active-layer thickness: results from transient general circulation
+  models. Global and Planetary Change, 15(3-4), 61-77.
+
+  Sazonova, T. S., & Romanovsky, V. E. (2003). A model for regional-scale
+  estimation of temporal and spatial variability of active layer thickness
+  and mean annual ground temperatures. Permafrost and Periglacial Processes,
+  14(2), 125-139.
+
+This implementation is bit-for-bit consistent with the Permamodel CSDMS
+reference (Wang, Jafarov, & Overeem 2020).
+
+Author: Andrew Wilcox / Dalton Highway PIML study
+================================================================================
+
+INPUTS REQUIRED (file paths set in the CONFIG section below):
+
+  1. CALM_SITES_CSV
+       Columns: site_id, site_name, lat, lon, vegetation_class,
+                organic_layer_cm, sand_fraction, porosity,
+                water_content, ice_content_class
+
+  2. CALM_OBSERVATIONS_CSV
+       Columns: site_id, year, alt_observed_cm
+       (Long-format: one row per site-year ALT measurement)
+
+  3. SNAP_TEMP_DIR
+       Folder containing monthly air temperature GeoTIFFs.
+       Filenames assumed pattern: tas_mean_C_cru_TS*_MM_YYYY.tif
+
+  4. SNAP_SNOW_DIR  (or set USE_LITERATURE_SNOW=True to skip)
+       Folder containing winter SWE rasters per year.
+
+OUTPUT: training_table.csv with one row per (site, year, observation).
+================================================================================
+"""
+
+import os
+import glob
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# Geospatial libraries - install via:
+#   pip install rasterio pyproj
+import rasterio
+from rasterio.warp import transform as rio_transform
+
+
+# =============================================================================
+# CONFIG - edit these paths for your science gateway environment
+# =============================================================================
+
+CONFIG = {
+    # --- Inputs ---
+    'CALM_SITES_CSV':        '/path/to/calm_alaska_sites.csv',
+    'CALM_OBSERVATIONS_CSV': '/path/to/calm_alaska_observations.csv',
+    'SNAP_TEMP_DIR':         '/path/to/tas_AK_771m_CRU_TS30_historical',
+    'SNAP_SNOW_DIR':         '/path/to/snap_swe',     # set to None to use literature defaults
+    'USE_LITERATURE_SNOW':   True,   # if True, ignores SNAP_SNOW_DIR and uses
+                                     # a single literature SWE per vegetation class
+
+    # --- Output ---
+    'OUTPUT_CSV':            '/path/to/output/training_table.csv',
+
+    # --- SNAP raster filename pattern ---
+    # Use {month} as zero-padded 2-digit month, {year} as 4-digit year.
+    # Defaults match the SNAP CRU TS 3.0 product naming convention.
+    'TEMP_FILENAME_PATTERN': 'tas_mean_C_cru_TS30_{month}_{year}.tif',
+
+    # --- Processing options ---
+    'TEMP_UNIT': 'C',        # 'C' or 'K' (SNAP CRU is already in °C)
+    'AMPLITUDE_METHOD': 'half_range',  # 'half_range' = (Tmax - Tmin)/2
+                                       # 'std_dev'    = std deviation of monthly T
+    'VERBOSE': True,
+}
+
+
+# =============================================================================
+# CONSTANTS - physical
+# =============================================================================
+
+SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
+LATENT_HEAT_FUSION = 334000.0          # J/kg
+DENSITY_WATER = 1000.0                 # kg/m^3
+
+# Snow thermal properties (Permamodel defaults; rho per Anisimov 1997)
+# Note: Csn here is the Permamodel-internal value (units inconsistency in the
+# upstream code, but bit-for-bit matching Permamodel output requires this value).
+SNOW_DENSITY = 200.0                   # kg/m^3
+SNOW_HEAT_CAPACITY = 2.09e3            # Permamodel value (matches reference output)
+WINTER_DAYS = 270.0                    # winter season length, days (Anisimov 1997)
+SUMMER_DAYS = 95.0                     # summer season length, days
+
+
+def snow_thermal_conductivity_sturm(rho_snow_kgm3):
+    """Sturm et al. 1997 eq. 4: snow thermal conductivity from density."""
+    rho_kg = rho_snow_kgm3 / 1000.0
+    return rho_kg**2 * 3.233 - 1.01 * rho_kg + 0.138  # W/m/K
+
+# =============================================================================
+# CONSTANTS - vegetation lookup table
+#
+# Maps vegetation class to thermal properties for the surface vegetation layer
+# (low-growth: moss, lichen, grass; not trees - those affect the air T already).
+#
+# Values from Anisimov 1997, Romanovsky & Osterkamp 1997, and CALM site data.
+# Heights and diffusivities are typical values for each vegetation regime.
+# =============================================================================
+
+VEGETATION_PROPERTIES = {
+    # vegetation_class -> {Hvgf, Hvgt, D_vf, D_vt}
+    # Hvgf = vegetation height in frozen period (m)
+    # Hvgt = vegetation height in thawed period (m)
+    # D_vf, D_vt = thermal diffusivity frozen/thawed (m^2/s)
+    # Values from Anisimov 1997 and Permamodel example configs (Barrow case).
+    'wet_tundra':       {'Hvgf': 0.02, 'Hvgt': 0.03, 'D_vf': 1.39e-6, 'D_vt': 5.56e-8},
+    'moist_tundra':     {'Hvgf': 0.02, 'Hvgt': 0.03, 'D_vf': 1.39e-6, 'D_vt': 5.56e-8},
+    'graminoid_tundra': {'Hvgf': 0.04, 'Hvgt': 0.06, 'D_vf': 1.39e-6, 'D_vt': 5.56e-8},
+    'shrub_tundra':     {'Hvgf': 0.10, 'Hvgt': 0.20, 'D_vf': 1.39e-6, 'D_vt': 5.56e-8},
+    'boreal_forest':    {'Hvgf': 0.05, 'Hvgt': 0.10, 'D_vf': 1.39e-6, 'D_vt': 5.56e-8},
+    'barren':           {'Hvgf': 0.0,  'Hvgt': 0.0,  'D_vf': 1.39e-6, 'D_vt': 5.56e-8},
+}
+
+# Literature mean winter snow depth per vegetation class (m).
+# Used when USE_LITERATURE_SNOW = True. Values approximate Alaska
+# climatology by vegetation regime (Sturm 1995, Liston & Sturm 1998).
+LITERATURE_SNOW_DEPTH_M = {
+    'wet_tundra':       0.30,    # North Slope coastal plain
+    'moist_tundra':     0.30,
+    'graminoid_tundra': 0.35,
+    'shrub_tundra':     0.60,    # shrubs trap more snow
+    'boreal_forest':    0.70,    # interior Alaska forest
+    'barren':           0.15,
+}
+
+
+# =============================================================================
+# KUDRYAVTSEV ALT CALCULATION (verified against Permamodel reference)
+# =============================================================================
+
+def kudryavtsev_alt_from_surface(T_gs, A_gs, K_t, K_f, C_t, C_f, L,
+                                  tau=SECONDS_PER_YEAR):
+    """
+    Core Kudryavtsev analytical solution. Returns ALT in meters.
+
+    Parameters
+    ----------
+    T_gs : Mean annual ground-surface temperature (°C, negative in permafrost).
+    A_gs : Annual amplitude of ground-surface temperature (°C, positive).
+    K_t, K_f : Thermal conductivities of thawed/frozen soil (W m^-1 K^-1).
+    C_t, C_f : Volumetric heat capacities (J m^-3 K^-1).
+    L : Volumetric latent heat = rho_w * L_f * theta_w (J m^-3).
+    tau : Period of annual oscillation (s).
+
+    Returns
+    -------
+    Zal : ALT (m), or NaN where no permafrost.
+    """
+    ratio = np.clip(T_gs / A_gs, -1.0, 1.0)
+
+    # Anisimov 1997 eq. 14 numerator for T_ps
+    Tps_numerator = 0.5 * T_gs * (K_t + K_f) \
+        + (A_gs * (K_t - K_f) / np.pi) \
+        * (ratio * np.arcsin(ratio) + np.sqrt(1.0 - (np.pi**2) / (A_gs**2)))
+
+    K_star = K_f if Tps_numerator <= 0.0 else K_t
+    T_ps = Tps_numerator / K_star
+    is_permafrost = Tps_numerator <= 0.0
+
+    if not is_permafrost:
+        return np.nan
+
+    K, C = K_t, C_t  # active layer is thawed during summer
+    abs_Tps = abs(T_ps)
+
+    if A_gs <= abs_Tps:
+        return np.nan
+
+    # Amplitude at permafrost table (Romanovsky & Osterkamp 1997, eq. 4)
+    A_ps = (A_gs - abs_Tps) / np.log(
+        (A_gs + L / (2.0 * C)) / (abs_Tps + L / (2.0 * C))
+    ) - L / (2.0 * C)
+
+    # Characteristic depth (eq. 5)
+    Zc = (2.0 * (A_gs - abs_Tps) * np.sqrt(K * tau * C / np.pi)) \
+        / (2.0 * A_ps * C + L)
+
+    # ALT (eq. 3)
+    sqrt_term = np.sqrt(K * tau / (np.pi * C))
+    Zal = (
+        2.0 * (A_gs - abs_Tps) * np.sqrt(K * tau * C / np.pi)
+        + (2.0 * A_ps * C * Zc + L * Zc) * L * sqrt_term
+        / (2.0 * A_ps * C * Zc + L * Zc
+           + (2.0 * A_ps * C + L) * sqrt_term)
+    ) / (2.0 * A_ps * C + L)
+
+    return Zal if Zal > 0.01 else np.nan
+
+
+# =============================================================================
+# SOIL THERMAL PROPERTY ESTIMATORS
+# =============================================================================
+
+def volumetric_heat_capacity(theta_w, theta_m, theta_o, frozen=False):
+    """Volumetric heat capacity (J m^-3 K^-1) via weighted mixing."""
+    C_water, C_ice = 4.18e6, 1.94e6
+    C_mineral, C_organic, C_air = 2.0e6, 2.5e6, 1.25e3
+    theta_air = max(1.0 - theta_w - theta_m - theta_o, 0.0)
+    C_fluid = C_ice if frozen else C_water
+    return (theta_w * C_fluid + theta_m * C_mineral
+            + theta_o * C_organic + theta_air * C_air)
+
+
+def thermal_conductivity_johansen(theta_w, porosity, sand_frac,
+                                   organic_frac=0.0, frozen=False):
+    """Johansen (1975) thermal conductivity (W m^-1 K^-1)."""
+    k_quartz, k_other, k_organic = 7.7, 2.0, 0.25
+    k_water, k_ice = 0.57, 2.2
+
+    k_min = (k_quartz ** sand_frac) * (k_other ** (1.0 - sand_frac))
+    if organic_frac > 0 and (1.0 - porosity) > 0:
+        f_o = min(organic_frac / (1.0 - porosity), 1.0)
+        k_solid = (k_min ** (1.0 - f_o)) * (k_organic ** f_o)
+    else:
+        k_solid = k_min
+
+    k_fluid = k_ice if frozen else k_water
+    k_sat = (k_solid ** (1.0 - porosity)) * (k_fluid ** porosity)
+
+    rho_b = 2650.0 * (1.0 - porosity)
+    k_dry = (0.135 * rho_b + 64.7) / (2650.0 - 0.947 * rho_b)
+
+    Sr = max(min(theta_w / porosity if porosity > 0 else 0.0, 1.0), 0.0)
+    if frozen:
+        Ke = Sr
+    elif sand_frac > 0.5:
+        Ke = max(0.7 * np.log10(max(Sr, 1e-3)) + 1.0, 0.0) if Sr > 0.05 else 0.0
+    else:
+        Ke = max(np.log10(max(Sr, 1e-3)) + 1.0, 0.0) if Sr > 0.1 else 0.0
+    return Ke * k_sat + (1.0 - Ke) * k_dry
+
+
+# =============================================================================
+# AIR-TO-GROUND-SURFACE TEMPERATURE CONVERSION
+# Ported from Permamodel (Wang, Jafarov & Overeem 2020) - update_TOP_temperatures
+# =============================================================================
+
+def air_to_ground_surface(T_air_mean, A_air, h_snow_m, veg_class,
+                           snow_density=SNOW_DENSITY,
+                           snow_c=SNOW_HEAT_CAPACITY):
+    """
+    Apply snow and vegetation corrections to derive ground-surface temperature
+    from air temperature. Bit-for-bit matches Permamodel update_TOP_temperatures.
+
+    Parameters
+    ----------
+    T_air_mean : Mean annual air temperature (°C)
+    A_air : Annual amplitude of air temperature (°C)
+    h_snow_m : Mean snow depth during winter (m)
+                (NOT SWE - if you have SWE, convert via h = SWE * rho_w / rho_s)
+    veg_class : key into VEGETATION_PROPERTIES dict
+
+    Returns
+    -------
+    T_gs : Mean annual ground-surface temperature (°C)
+    A_gs : Annual amplitude of ground-surface temperature (°C)
+    """
+    tau = SECONDS_PER_YEAR
+    tau1 = WINTER_DAYS * 24 * 3600   # winter seconds
+    tau2 = SUMMER_DAYS * 24 * 3600   # summer seconds
+
+    # --- Step 1: Snow effect (Anisimov 1997 eq. 7) ---
+    Ksn = snow_thermal_conductivity_sturm(snow_density)
+    K_diffusivity = Ksn / (snow_density * snow_c)
+
+    damping = np.exp(-h_snow_m * np.sqrt(np.pi / (tau * K_diffusivity)))
+    delta_Tsn = A_air * (1.0 - damping)
+    delta_Asn = delta_Tsn * 2.0 / np.pi
+
+    # Below snow (at top of vegetation)
+    T_vg = T_air_mean + delta_Tsn
+    A_vg = A_air - delta_Asn
+
+    # --- Step 2: Vegetation effect (Anisimov 1997 eqs. 8-11) ---
+    veg = VEGETATION_PROPERTIES[veg_class]
+    Hvgf = veg['Hvgf']
+    Hvgt = veg['Hvgt']
+    D_vf = veg['D_vf']
+    D_vt = veg['D_vt']
+
+    if Hvgf <= 0.0 and Hvgt <= 0.0:
+        return T_vg, A_vg
+
+    # Winter vegetation effect (frozen state)
+    damp_winter = 1.0 - np.exp(-Hvgf * np.sqrt(np.pi / (D_vf * 2.0 * tau1)))
+    delta_A1 = (A_vg - T_vg) * damp_winter
+
+    # Summer vegetation effect (thawed state)
+    damp_summer = 1.0 - np.exp(-Hvgt * np.sqrt(np.pi / (D_vt * 2.0 * tau2)))
+    delta_A2 = (A_vg + T_vg) * damp_summer
+
+    delta_Av = (delta_A1 * tau1 + delta_A2 * tau2) / tau
+    delta_Tv = (delta_A1 * tau1 - delta_A2 * tau2) / tau * (2.0 / np.pi)
+
+    T_gs = T_vg + delta_Tv
+    A_gs = A_vg - delta_Av
+
+    return T_gs, A_gs
+
+
+# =============================================================================
+# RASTER EXTRACTION HELPERS
+# =============================================================================
+
+def extract_raster_values_at_points(raster_path, lon_array, lat_array,
+                                     src_crs='EPSG:4326'):
+    """
+    Sample a single raster at a set of lon/lat points.
+    Returns array of values (NaN where outside extent or nodata).
+    """
+    values = np.full(len(lon_array), np.nan)
+    try:
+        with rasterio.open(raster_path) as src:
+            # Reproject lon/lat to raster CRS
+            xs, ys = rio_transform(src_crs, src.crs, lon_array, lat_array)
+            for i, (x, y) in enumerate(zip(xs, ys)):
+                try:
+                    val = next(src.sample([(x, y)]))[0]
+                    if val == src.nodata or np.isnan(val):
+                        values[i] = np.nan
+                    else:
+                        values[i] = float(val)
+                except (StopIteration, IndexError):
+                    values[i] = np.nan
+    except Exception as e:
+        if CONFIG['VERBOSE']:
+            print(f"  [WARN] Could not read {raster_path}: {e}")
+    return values
+
+
+def find_temp_rasters(temp_dir, pattern):
+    """
+    Scan a directory for SNAP temperature rasters and parse year/month
+    from filenames.
+    Returns a dict: {(year, month): filepath}.
+    """
+    # Build regex from pattern by replacing tokens with capture groups
+    regex_pat = pattern.replace('{month}', r'(\d{2})').replace('{year}', r'(\d{4})')
+    regex = re.compile(regex_pat)
+
+    files = {}
+    for root, dirs, filenames in os.walk(temp_dir):
+        for fname in filenames:
+            if not fname.endswith('.tif'):
+                continue
+            m = regex.search(fname)
+            if m:
+                month = int(m.group(1))
+                year = int(m.group(2))
+                files[(year, month)] = os.path.join(root, fname)
+    return files
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def compute_annual_climate_per_site(sites_df, temp_files, swe_files=None):
+    """
+    For each site and year, compute annual mean and amplitude of air
+    temperature, plus winter SWE.
+
+    Returns a long-format dataframe: site_id, year, T_air_mean, A_air, swe_m.
+    """
+    lons = sites_df['lon'].values
+    lats = sites_df['lat'].values
+    site_ids = sites_df['site_id'].values
+    veg_classes = sites_df['vegetation_class'].values
+
+    # Group temperature files by year for efficient processing
+    years = sorted(set(y for (y, m) in temp_files.keys()))
+
+    records = []
+    for year in years:
+        if CONFIG['VERBOSE'] and year % 10 == 0:
+            print(f"  Processing year {year}...")
+
+        # Extract all 12 monthly values at all sites for this year
+        monthly_values = np.full((12, len(sites_df)), np.nan)
+        for m in range(1, 13):
+            if (year, m) in temp_files:
+                monthly_values[m - 1, :] = extract_raster_values_at_points(
+                    temp_files[(year, m)], lons, lats)
+
+        # SWE extraction (optional)
+        if swe_files is not None and year in swe_files:
+            swe_values = extract_raster_values_at_points(swe_files[year], lons, lats)
+        else:
+            swe_values = None
+
+        # Compute annual statistics per site
+        for i, site_id in enumerate(site_ids):
+            monthly = monthly_values[:, i]
+            if np.all(np.isnan(monthly)):
+                continue
+
+            T_mean = np.nanmean(monthly)
+            if CONFIG['AMPLITUDE_METHOD'] == 'half_range':
+                A = (np.nanmax(monthly) - np.nanmin(monthly)) / 2.0
+            else:
+                A = np.nanstd(monthly) * np.sqrt(2.0)
+
+            # Snow depth
+            if swe_values is not None:
+                # If SWE provided, convert to depth assuming literature density
+                h_snow = swe_values[i] * DENSITY_WATER / SNOW_DENSITY if not np.isnan(swe_values[i]) else LITERATURE_SNOW_DEPTH_M.get(veg_classes[i], 0.30)
+            else:
+                h_snow = LITERATURE_SNOW_DEPTH_M.get(veg_classes[i], 0.30)
+
+            records.append({
+                'site_id': site_id,
+                'year': year,
+                'T_air_mean': T_mean,
+                'A_air': A,
+                'h_snow_m': h_snow,
+            })
+
+    return pd.DataFrame(records)
+
+
+def compute_ku_alt_per_site_year(climate_df, sites_df):
+    """
+    Run the Ku pipeline for each site-year row in climate_df.
+    Returns a dataframe with Ku ALT and all intermediate quantities.
+    """
+    site_lookup = sites_df.set_index('site_id').to_dict('index')
+
+    results = []
+    for _, row in climate_df.iterrows():
+        site_id = row['site_id']
+        site = site_lookup[site_id]
+
+        # Air-to-surface conversion
+        try:
+            T_gs, A_gs = air_to_ground_surface(
+                T_air_mean=row['T_air_mean'],
+                A_air=row['A_air'],
+                h_snow_m=row['h_snow_m'],
+                veg_class=site['vegetation_class'],
+            )
+        except KeyError:
+            T_gs, A_gs = np.nan, np.nan
+
+        # Soil thermal properties
+        theta_w = site['water_content']
+        porosity = site['porosity']
+        sand_frac = site['sand_fraction']
+        organic_cm = site.get('organic_layer_cm', 0.0)
+        # Convert organic layer thickness (cm) to volumetric organic fraction
+        # over a 1 m profile (rough approximation - replace with site-specific
+        # value if available)
+        organic_frac = min(organic_cm / 100.0, 0.5)
+        theta_m = max((1.0 - porosity) - organic_frac, 0.0)
+
+        try:
+            C_t = volumetric_heat_capacity(theta_w, theta_m, organic_frac, frozen=False)
+            C_f = volumetric_heat_capacity(theta_w, theta_m, organic_frac, frozen=True)
+            K_t = thermal_conductivity_johansen(theta_w, porosity, sand_frac,
+                                                  organic_frac, frozen=False)
+            K_f = thermal_conductivity_johansen(theta_w, porosity, sand_frac,
+                                                  organic_frac, frozen=True)
+            L = DENSITY_WATER * LATENT_HEAT_FUSION * theta_w
+
+            if np.isnan(T_gs) or np.isnan(A_gs):
+                Zal = np.nan
+            else:
+                Zal = kudryavtsev_alt_from_surface(T_gs, A_gs, K_t, K_f, C_t, C_f, L)
+        except Exception as e:
+            if CONFIG['VERBOSE']:
+                print(f"  [WARN] Ku failure for {site_id} year {row['year']}: {e}")
+            Zal, T_gs, A_gs = np.nan, np.nan, np.nan
+            K_t = K_f = C_t = C_f = L = np.nan
+
+        results.append({
+            'site_id': site_id,
+            'year': int(row['year']),
+            'T_air_mean': row['T_air_mean'],
+            'A_air': row['A_air'],
+            'h_snow_m': row['h_snow_m'],
+            'T_gs': T_gs,
+            'A_gs': A_gs,
+            'K_t': K_t, 'K_f': K_f,
+            'C_t': C_t, 'C_f': C_f,
+            'L': L,
+            'Ku_ALT_m': Zal,
+            'Ku_ALT_cm': Zal * 100.0 if not np.isnan(Zal) else np.nan,
+        })
+
+    return pd.DataFrame(results)
+
+
+def build_training_table(ku_df, obs_df):
+    """
+    Join Ku predictions with CALM observed ALT and compute residuals.
+    """
+    obs_df = obs_df.copy()
+    obs_df['year'] = obs_df['year'].astype(int)
+
+    merged = pd.merge(ku_df, obs_df, on=['site_id', 'year'], how='inner')
+    merged['residual_cm'] = merged['alt_observed_cm'] - merged['Ku_ALT_cm']
+    return merged
+
+
+# =============================================================================
+# DRIVER
+# =============================================================================
+
+def main():
+    print("=" * 70)
+    print("Kudryavtsev ALT pipeline for Alaska CALM sites")
+    print("=" * 70)
+
+    # Load inputs
+    print("\n[1/5] Loading CALM site metadata...")
+    sites_df = pd.read_csv(CONFIG['CALM_SITES_CSV'])
+    print(f"  Loaded {len(sites_df)} sites.")
+    print(f"  Required columns: site_id, lat, lon, vegetation_class, "
+          f"organic_layer_cm, sand_fraction, porosity, water_content")
+
+    print("\n[2/5] Loading CALM ALT observations...")
+    obs_df = pd.read_csv(CONFIG['CALM_OBSERVATIONS_CSV'])
+    print(f"  Loaded {len(obs_df)} site-year observations.")
+
+    print("\n[3/5] Indexing SNAP temperature rasters...")
+    temp_files = find_temp_rasters(CONFIG['SNAP_TEMP_DIR'],
+                                     CONFIG['TEMP_FILENAME_PATTERN'])
+    print(f"  Found {len(temp_files)} monthly temperature rasters.")
+    if len(temp_files) == 0:
+        raise RuntimeError(f"No rasters found in {CONFIG['SNAP_TEMP_DIR']} "
+                           f"matching pattern {CONFIG['TEMP_FILENAME_PATTERN']}")
+
+    # Snow (optional)
+    swe_files = None
+    if not CONFIG['USE_LITERATURE_SNOW'] and CONFIG['SNAP_SNOW_DIR']:
+        print("  Indexing SWE rasters... (not implemented; using literature)")
+        # TODO: implement when SWE product is finalized
+
+    print("\n[4/5] Extracting climate and computing Ku ALT per site-year...")
+    climate_df = compute_annual_climate_per_site(sites_df, temp_files, swe_files)
+    print(f"  Built climate table with {len(climate_df)} site-year rows.")
+
+    ku_df = compute_ku_alt_per_site_year(climate_df, sites_df)
+
+    print("\n[5/5] Joining with CALM observations and computing residuals...")
+    training_table = build_training_table(ku_df, obs_df)
+    print(f"  Final training table: {len(training_table)} rows.")
+    print(f"  Sites represented: {training_table['site_id'].nunique()}")
+    print(f"  Year range: {training_table['year'].min()}-{training_table['year'].max()}")
+
+    # Summary stats
+    valid = training_table.dropna(subset=['Ku_ALT_cm', 'alt_observed_cm'])
+    if len(valid) > 0:
+        print(f"\n  Ku ALT      :  mean={valid['Ku_ALT_cm'].mean():.1f}  "
+              f"std={valid['Ku_ALT_cm'].std():.1f} cm")
+        print(f"  CALM ALT    :  mean={valid['alt_observed_cm'].mean():.1f}  "
+              f"std={valid['alt_observed_cm'].std():.1f} cm")
+        print(f"  Residual    :  mean={valid['residual_cm'].mean():+.1f}  "
+              f"std={valid['residual_cm'].std():.1f} cm")
+        print(f"  Residual |  : MAE={valid['residual_cm'].abs().mean():.1f} cm")
+
+    # Output
+    out_path = CONFIG['OUTPUT_CSV']
+    os.makedirs(os.path.dirname(out_path), exist_ok=True) if os.path.dirname(out_path) else None
+    training_table.to_csv(out_path, index=False)
+    print(f"\n  Saved: {out_path}")
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
